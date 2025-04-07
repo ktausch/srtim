@@ -1,5 +1,6 @@
 //! The `srtim` library represents and provides utilities to create
 //! speedrun runs (with death tracking for video games).
+use coerce_pattern::coerce_pattern;
 use std::collections::HashSet;
 use std::collections::{HashMap, hash_map::Entry};
 use std::fmt::{self, Debug, Display};
@@ -216,6 +217,7 @@ pub enum Error {
     },
 }
 
+/// Type for Result whose Error is from this library
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Debug for Error {
@@ -404,7 +406,7 @@ impl Display for Error {
     }
 }
 
-/// A struct to store a specific instant in time via the number of milliseconds since the unix epoch
+/// A specific instant in time via the number of milliseconds since the unix epoch
 #[derive(Clone, Copy)]
 pub struct MillisecondsSinceEpoch(pub u128);
 impl MillisecondsSinceEpoch {
@@ -774,26 +776,15 @@ impl<T: PartialEq, U: Iterator<Item = T>, V: Iterator<Item = T>> Iterator
         } else {
             let first = self.iterators.0.next();
             let second = self.iterators.1.next();
-            match first {
-                Some(first) => match second {
-                    Some(second) => {
-                        if first == second {
-                            Some(first)
-                        } else {
-                            self.depleted = true;
-                            None
-                        }
+            if let Some(first) = first {
+                if let Some(second) = second {
+                    if first == second {
+                        return Some(first);
                     }
-                    None => {
-                        self.depleted = true;
-                        None
-                    }
-                },
-                None => {
-                    self.depleted = true;
-                    None
                 }
             }
+            self.depleted = true;
+            None
         }
     }
 }
@@ -1299,39 +1290,43 @@ where
             .map(|(&name, _)| name)
             .enumerate()
             .for_each(|(index, id_name)| {
+                let part = parts.get(id_name).unwrap();
                 match N {
-                    0 => match parts.get(id_name).unwrap() {
-                        ConfigPart::Segment(segment_info) => {
-                            new.push(RunPart::SingleSegment(segment_info));
-                        }
-                        _ => panic!("This shouldn't ever happen!"),
-                    },
-                    _ => match parts.get(id_name).unwrap() {
-                        ConfigPart::Group(SegmentGroupInfo {
+                    0 => {
+                        let segment_info = coerce_pattern!(
+                            part,
+                            ConfigPart::Segment(segment_info),
+                            segment_info
+                        );
+                        new.push(RunPart::SingleSegment(segment_info));
+                    }
+                    _ => {
+                        let SegmentGroupInfo {
                             display_name,
                             part_id_names,
                             file_name,
-                        }) => {
-                            let mut components = Vec::new();
-                            components.reserve(part_id_names.len());
-                            for part_id_name in part_id_names {
-                                let part_id_name = part_id_name.as_str();
-                                let this_order = order[part_id_name];
-                                let (existing_indices, existing_level) =
-                                    existing[this_order];
-                                components.push(
-                                    &existing_level
-                                        [existing_indices[part_id_name]],
-                                );
-                            }
-                            new.push(RunPart::Group {
-                                display_name: display_name.as_str(),
-                                components,
-                                file_name: file_name.as_path(),
-                            });
+                        } = coerce_pattern!(
+                            part,
+                            ConfigPart::Group(segment_group_info),
+                            segment_group_info
+                        );
+                        let mut components =
+                            Vec::with_capacity(part_id_names.len());
+                        for part_id_name in part_id_names {
+                            let part_id_name = part_id_name.as_str();
+                            let this_order = order[part_id_name];
+                            let (existing_indices, existing_level) =
+                                existing[this_order];
+                            components.push(
+                                &existing_level[existing_indices[part_id_name]],
+                            );
                         }
-                        _ => panic!("This shouldn't ever happen!"),
-                    },
+                        new.push(RunPart::Group {
+                            display_name: display_name.as_str(),
+                            components,
+                            file_name: file_name.as_path(),
+                        });
+                    }
                 }
                 indices.insert(id_name, index);
             });
@@ -1647,6 +1642,7 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coerce_pattern::assert_pattern;
     use std::env::temp_dir;
     use std::fs::remove_file;
     use std::ptr;
@@ -1691,12 +1687,10 @@ mod tests {
     fn negative_duration() {
         let start = MillisecondsSinceEpoch(10);
         let end = MillisecondsSinceEpoch(0);
-        assert!(MillisecondsSinceEpoch::duration(start, end).is_err_and(
-            |error| match error {
-                Error::NegativeDuration { start: 10, end: 0 } => true,
-                _ => false,
-            }
-        ));
+        assert_pattern!(
+            MillisecondsSinceEpoch::duration(start, end),
+            Err(Error::NegativeDuration { start: 10, end: 0 })
+        );
     }
 
     /// Tests that segment runs can be combined if one starts when the other ends
@@ -1729,10 +1723,10 @@ mod tests {
             end: MillisecondsSinceEpoch(10),
         };
         let clone = existing.clone();
-        assert!(existing.accumulate(&clone).is_err_and(|error| match error {
-            Error::SegmentCombinationError => true,
-            _ => false,
-        }));
+        assert_pattern!(
+            existing.accumulate(&clone),
+            Err(Error::SegmentCombinationError)
+        );
     }
 
     /// Ensures that the duration of a segment run is correctly computed from difference of endpoints
@@ -1804,12 +1798,13 @@ mod tests {
     fn load_all_segment_runs_nonexistent_file() {
         let temp =
             temp_dir().join("load_all_segment_runs_nonexistent_file.csv");
-        assert!(SegmentRun::load_all(&temp).is_err_and(|error| match error {
-            Error::CouldNotReadSegmentRunFile { path, error } => {
-                (temp == path) && (error.kind() == io::ErrorKind::NotFound)
-            }
-            _ => false,
-        }));
+        let (path, error) = coerce_pattern!(
+            SegmentRun::load_all(&temp),
+            Err(Error::CouldNotReadSegmentRunFile { path, error }),
+            (path, error)
+        );
+        assert_eq!(temp, path);
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     /// Tests that a SegmentRunFileLineParseError is returned if
@@ -1821,43 +1816,37 @@ mod tests {
             "start,end,deaths\n0,10,0\n15.,20,1\n",
         )
         .unwrap();
-        assert!(SegmentRun::load_all(&temp_file.path).is_err_and(|error| {
-            match error {
-                Error::SegmentRunFileLineParseError {
-                    index: 2,
-                    column: 0,
-                } => true,
-                _ => false,
-            }
-        }));
+        assert_pattern!(
+            SegmentRun::load_all(&temp_file.path),
+            Err(Error::SegmentRunFileLineParseError {
+                index: 2,
+                column: 0
+            })
+        );
         let temp_file = TempFile::with_contents(
             temp_dir().join("load_all_segment_runs_unparsable_1.csv"),
             "start,end,deaths\n0,1h,0\n",
         )
         .unwrap();
-        assert!(SegmentRun::load_all(&temp_file.path).is_err_and(|error| {
-            match error {
-                Error::SegmentRunFileLineParseError {
-                    index: 1,
-                    column: 1,
-                } => true,
-                _ => false,
-            }
-        }));
+        assert_pattern!(
+            SegmentRun::load_all(&temp_file.path),
+            Err(Error::SegmentRunFileLineParseError {
+                index: 1,
+                column: 1
+            })
+        );
         let temp_file = TempFile::with_contents(
             temp_dir().join("load_all_segment_runs_unparsable_2.csv"),
             "start,end,deaths\n0,10,0.\n",
         )
         .unwrap();
-        assert!(SegmentRun::load_all(&temp_file.path).is_err_and(|error| {
-            match error {
-                Error::SegmentRunFileLineParseError {
-                    index: 1,
-                    column: 2,
-                } => true,
-                _ => false,
-            }
-        }));
+        assert_pattern!(
+            SegmentRun::load_all(&temp_file.path),
+            Err(Error::SegmentRunFileLineParseError {
+                index: 1,
+                column: 2
+            })
+        );
     }
 
     /// Tests that load_all fails to load segment runs if there are too many or too few comas on a row
@@ -1868,16 +1857,14 @@ mod tests {
             "start,end,deaths\n0,10,10,\n",
         )
         .unwrap();
-        assert!(SegmentRun::load_all(&temp_file.path).is_err_and(|error| {
-            match error {
-                Error::InvalidSegmentRunFileLine {
-                    index: 1,
-                    too_many_separators: true,
-                    expected_number_of_elements: 3,
-                } => true,
-                _ => false,
-            }
-        }));
+        assert_pattern!(
+            SegmentRun::load_all(&temp_file.path),
+            Err(Error::InvalidSegmentRunFileLine {
+                index: 1,
+                too_many_separators: true,
+                expected_number_of_elements: 3
+            })
+        );
     }
 
     /// Tests that load_all fails to load segment runs if there are too many or too few comas on a row
@@ -1888,16 +1875,14 @@ mod tests {
             "start,end,deaths\n0,10\n",
         )
         .unwrap();
-        assert!(SegmentRun::load_all(&temp_file.path).is_err_and(|error| {
-            match error {
-                Error::InvalidSegmentRunFileLine {
-                    index: 1,
-                    too_many_separators: false,
-                    expected_number_of_elements: 3,
-                } => true,
-                _ => false,
-            }
-        }));
+        assert_pattern!(
+            SegmentRun::load_all(&temp_file.path),
+            Err(Error::InvalidSegmentRunFileLine {
+                index: 1,
+                too_many_separators: false,
+                expected_number_of_elements: 3
+            })
+        );
     }
 
     /// Ensures that SegmentInfo requires an absolute path file_name
@@ -1940,7 +1925,7 @@ mod tests {
     /// 2. yields None forever after being depleted
     /// 3. does not yield from the source iterators more than it needs to
     #[test]
-    fn test_zip_same() {
+    fn test_zip_same_both_continue() {
         let mut x_yielded: Vec<i32> = vec![];
         let mut y_yielded: Vec<i32> = vec![];
         let x = [1, 2, 3, 4].into_iter().map(|value| {
@@ -1970,15 +1955,76 @@ mod tests {
         assert_eq!(y_yielded_iter.next().unwrap(), 5);
     }
 
+    /// Tests that the zip_same iterator stops yielding elements
+    /// from the iterators it is passed if one of them ends.
+    #[test]
+    fn test_zip_same_first_continues() {
+        let mut x_yielded: Vec<i32> = vec![];
+        let mut y_yielded: Vec<i32> = vec![];
+        let x = [1, 2, 3, 4].into_iter().map(|value| {
+            x_yielded.push(value);
+            value
+        });
+        let y = vec![1].into_iter().map(|value| {
+            y_yielded.push(value);
+            value
+        });
+        let mut z = zip_same(x, y);
+        assert_eq!(z.next().unwrap(), 1);
+        for _ in 0..5 {
+            assert!(z.next().is_none());
+        }
+        drop(z);
+        assert_eq!(x_yielded.len(), 2);
+        let mut x_yielded_iter = x_yielded.into_iter();
+        assert_eq!(x_yielded_iter.next().unwrap(), 1);
+        assert_eq!(x_yielded_iter.next().unwrap(), 2);
+        assert_eq!(y_yielded.len(), 1);
+        let mut y_yielded_iter = y_yielded.into_iter();
+        assert_eq!(y_yielded_iter.next().unwrap(), 1);
+    }
+
+    /// Tests that the zip_same iterator stops yielding elements
+    /// from the iterators it is passed if one of them ends.
+    #[test]
+    fn test_zip_same_second_continues() {
+        let mut x_yielded: Vec<i32> = vec![];
+        let mut y_yielded: Vec<i32> = vec![];
+        let x = [1].into_iter().map(|value| {
+            x_yielded.push(value);
+            value
+        });
+        let y = vec![1, 2, 5, 4, 6].into_iter().map(|value| {
+            y_yielded.push(value);
+            value
+        });
+        let mut z = zip_same(x, y);
+        assert_eq!(z.next().unwrap(), 1);
+        for _ in 0..5 {
+            assert!(z.next().is_none());
+        }
+        drop(z);
+        assert_eq!(x_yielded.len(), 1);
+        let mut x_yielded_iter = x_yielded.into_iter();
+        assert_eq!(x_yielded_iter.next().unwrap(), 1);
+        assert_eq!(y_yielded.len(), 2);
+        let mut y_yielded_iter = y_yielded.into_iter();
+        assert_eq!(y_yielded_iter.next().unwrap(), 1);
+        assert_eq!(y_yielded_iter.next().unwrap(), 2);
+    }
+
     /// Collects references to all of the SegmentInfo objects of low-level segments into a vector
     fn run_part_segments<'a>(part: &'a RunPart) -> Vec<&'a SegmentInfo> {
         match part {
             &RunPart::Group { .. } => part
                 .nested_segment_specs()
                 .iter()
-                .map(|s| match s.last().unwrap().1 {
-                    &RunPart::SingleSegment(segment) => segment,
-                    _ => panic!("This can't happen, compiler!"),
+                .map(|s| {
+                    coerce_pattern!(
+                        s.last().unwrap().1,
+                        &RunPart::SingleSegment(segment),
+                        segment
+                    )
                 })
                 .collect(),
             &RunPart::SingleSegment(segment) => vec![segment],
@@ -2069,108 +2115,117 @@ mod tests {
         let mut a_spec = segment_specs.next().unwrap().into_iter();
         let (index, a_part) = a_spec.next().unwrap();
         assert_eq!(index, 0);
-        match a_part {
-            &RunPart::Group { display_name, .. } => {
-                assert_eq!(display_name, "ABC");
+        assert_pattern!(
+            a_part,
+            &RunPart::Group {
+                display_name: "ABC",
+                ..
             }
-            _ => panic!("expected group, got segment"),
-        }
+        );
         let (index, a_part) = a_spec.next().unwrap();
         assert_eq!(index, 0);
-        match a_part {
-            &RunPart::Group { display_name, .. } => {
-                assert_eq!(display_name, "AB");
+        assert_pattern!(
+            a_part,
+            &RunPart::Group {
+                display_name: "AB",
+                ..
             }
-            _ => panic!("expected group, got segment"),
-        }
+        );
         let (index, a_part) = a_spec.next().unwrap();
         assert_eq!(index, 0);
-        match a_part {
-            &RunPart::SingleSegment(SegmentInfo { display_name, .. }) => {
-                assert_eq!(display_name, "A");
-            }
-            _ => panic!("expected segment, got group"),
-        }
+        assert_eq!(
+            coerce_pattern!(
+                a_part,
+                &RunPart::SingleSegment(SegmentInfo { display_name, .. }),
+                display_name
+            )
+            .as_str(),
+            "A"
+        );
         assert!(a_spec.next().is_none());
         let mut b_spec = segment_specs.next().unwrap().into_iter();
         let (index, b_part) = b_spec.next().unwrap();
         assert_eq!(index, 0);
-        match b_part {
-            &RunPart::Group { display_name, .. } => {
-                assert_eq!(display_name, "ABC");
+        assert_pattern!(
+            b_part,
+            &RunPart::Group {
+                display_name: "ABC",
+                ..
             }
-            _ => panic!("expected group, got segment"),
-        }
+        );
         let (index, b_part) = b_spec.next().unwrap();
         assert_eq!(index, 0);
-        match b_part {
-            &RunPart::Group { display_name, .. } => {
-                assert_eq!(display_name, "AB");
+        assert_pattern!(
+            b_part,
+            &RunPart::Group {
+                display_name: "AB",
+                ..
             }
-            _ => panic!("expected group, got segment"),
-        }
+        );
         let (index, b_part) = b_spec.next().unwrap();
         assert_eq!(index, 1);
-        match b_part {
-            &RunPart::SingleSegment(SegmentInfo { display_name, .. }) => {
-                assert_eq!(display_name, "B");
-            }
-            _ => panic!("expected segment, got group"),
-        }
+        assert_eq!(
+            coerce_pattern!(
+                b_part,
+                &RunPart::SingleSegment(SegmentInfo { display_name, .. }),
+                display_name
+            )
+            .as_str(),
+            "B"
+        );
         assert!(b_spec.next().is_none());
         let mut c_spec = segment_specs.next().unwrap().into_iter();
         let (index, c_part) = c_spec.next().unwrap();
         assert_eq!(index, 0);
-        match c_part {
-            &RunPart::Group { display_name, .. } => {
-                assert_eq!(display_name, "ABC");
+        assert_pattern!(
+            c_part,
+            &RunPart::Group {
+                display_name: "ABC",
+                ..
             }
-            _ => panic!("expected group, got segment"),
-        }
+        );
         let (index, c_part) = c_spec.next().unwrap();
         assert_eq!(index, 1);
-        match c_part {
-            &RunPart::SingleSegment(SegmentInfo { display_name, .. }) => {
-                assert_eq!(display_name, "C");
-            }
-            _ => panic!("expected segment, got group"),
-        }
+        assert_eq!(
+            coerce_pattern!(
+                c_part,
+                &RunPart::SingleSegment(SegmentInfo { display_name, .. }),
+                display_name
+            )
+            .as_str(),
+            "C"
+        );
         assert!(c_spec.next().is_none());
         let mut d_spec = segment_specs.next().unwrap().into_iter();
         let (index, d_part) = d_spec.next().unwrap();
         assert_eq!(index, 1);
-        match d_part {
-            &RunPart::SingleSegment(SegmentInfo { display_name, .. }) => {
-                assert_eq!(display_name, "D");
-            }
-            _ => panic!("expected segment, got group"),
-        }
+        assert_eq!(
+            coerce_pattern!(
+                d_part,
+                &RunPart::SingleSegment(SegmentInfo { display_name, .. }),
+                display_name
+            )
+            .as_str(),
+            "D"
+        );
         assert!(d_spec.next().is_none());
         let mut segments = run_part_segments(&run_part).into_iter();
-        match a_part {
-            &RunPart::SingleSegment(segment) => {
-                assert!(ptr::eq(segment, segments.next().unwrap()))
-            }
-            _ => panic!("expected segment, got group"),
-        }
-        match b_part {
-            &RunPart::SingleSegment(segment) => {
-                assert!(ptr::eq(segment, segments.next().unwrap()))
-            }
-            _ => panic!("expected segment, got group"),
-        }
-        match c_part {
-            &RunPart::SingleSegment(segment) => {
-                assert!(ptr::eq(segment, segments.next().unwrap()))
-            }
-            _ => panic!("expected segment, got group"),
-        }
-        match d_part {
-            &RunPart::SingleSegment(segment) => {
-                assert!(ptr::eq(segment, segments.next().unwrap()))
-            }
-            _ => panic!("expected segment, got group"),
-        }
+        let actual_a_segment =
+            coerce_pattern!(a_part, &RunPart::SingleSegment(segment), segment);
+        let expected_a_segment = segments.next().unwrap();
+        assert!(ptr::eq(actual_a_segment, expected_a_segment));
+        let actual_b_segment =
+            coerce_pattern!(b_part, &RunPart::SingleSegment(segment), segment);
+        let expected_b_segment = segments.next().unwrap();
+        assert!(ptr::eq(actual_b_segment, expected_b_segment));
+        let actual_c_segment =
+            coerce_pattern!(c_part, &RunPart::SingleSegment(segment), segment);
+        let expected_c_segment = segments.next().unwrap();
+        assert!(ptr::eq(actual_c_segment, expected_c_segment));
+        let actual_d_segment =
+            coerce_pattern!(d_part, &RunPart::SingleSegment(segment), segment);
+        let expected_d_segment = segments.next().unwrap();
+        assert!(ptr::eq(actual_d_segment, expected_d_segment));
         assert!(segments.next().is_none());
     }
 
@@ -2181,14 +2236,9 @@ mod tests {
         let (run_sender, run_receiver) = mpsc::channel();
         drop(run_receiver);
         let receive_events = thread::spawn(move || {
-            assert!(
-                SegmentRun::run_consecutive(1, event_receiver, run_sender)
-                    .is_err_and(|error| {
-                        match error {
-                            Error::FailedToSendSegment { index: 1u32 } => true,
-                            _ => false,
-                        }
-                    })
+            assert_pattern!(
+                SegmentRun::run_consecutive(1, event_receiver, run_sender),
+                Err(Error::FailedToSendSegment { index: 1 })
             );
         });
         event_sender.send(SegmentRunEvent::End).unwrap();
@@ -2203,21 +2253,15 @@ mod tests {
         let (run_sender, _) = mpsc::channel();
         drop(event_sender);
         thread::spawn(move || {
-            assert!(
-                SegmentRun::run_consecutive(1, event_receiver, run_sender)
-                    .is_err_and(|error| {
-                        match error {
-                            Error::ErrorDuringSegment {
-                                index: 1u32,
-                                error: sub_error,
-                            } => match sub_error.as_ref() {
-                                Error::ChannelClosedBeforeEnd => true,
-                                _ => false,
-                            },
-                            _ => false,
-                        }
-                    })
-            )
+            let sub_error = coerce_pattern!(
+                SegmentRun::run_consecutive(1, event_receiver, run_sender),
+                Err(Error::ErrorDuringSegment {
+                    index: 1,
+                    error: sub_error
+                }),
+                sub_error
+            );
+            assert_pattern!(sub_error.as_ref(), Error::ChannelClosedBeforeEnd);
         })
         .join()
         .unwrap();
@@ -2263,19 +2307,16 @@ mod tests {
     /// tokens than expected. In this case Err(true) should be returned.
     #[test]
     fn load_n_tokens_too_many() {
-        assert!(
-            load_n_tokens("hello,world".split(','), 1)
-                .is_err_and(|too_many_commas| too_many_commas)
-        );
+        assert_pattern!(load_n_tokens("hello,world".split(","), 1), Err(true));
     }
 
     /// Tests the load_n_tokens function in the case where there are fewer
     /// tokens than expected. In this case Err(false) should be returned.
     #[test]
     fn load_n_tokens_not_enough() {
-        assert!(
-            load_n_tokens("hello,world,howdy".split(','), 4)
-                .is_err_and(|too_many_commas| !too_many_commas)
+        assert_pattern!(
+            load_n_tokens("hello,world,howdy".split(","), 4),
+            Err(false)
         );
     }
 
@@ -2824,12 +2865,12 @@ mod tests {
     #[test]
     fn use_run_info_non_existent() {
         let (config, _temp_file) = make_abcd_config("h");
-        assert!(config.use_run_info("z", |_| {}).is_err_and(
-            |error| match error {
-                Error::IdNameNotFound { id_name } => id_name.as_str() == "z",
-                _ => false,
-            }
-        ));
+        let id_name = coerce_pattern!(
+            config.use_run_info("z", |_| {}),
+            Err(Error::IdNameNotFound { id_name }),
+            id_name
+        );
+        assert_eq!(id_name.as_str(), "z");
     }
 
     /// Tests that the Config::use_run_info function returns a TooMuchNesting
@@ -2837,14 +2878,12 @@ mod tests {
     #[test]
     fn use_run_info_too_nested() {
         let (config, _temp_file) = make_abcd_config("i");
-        assert!(config.use_run_info("abcdfg", |_| {}).is_err_and(|error| {
-            match error {
-                Error::TooMuchNesting {
-                    max_nesting_level: 4,
-                } => true,
-                _ => false,
-            }
-        }));
+        assert_pattern!(
+            config.use_run_info("abcdfg", |_| {}),
+            Err(Error::TooMuchNesting {
+                max_nesting_level: 4
+            })
+        );
     }
 
     /// Tests that the RunPart::save function can both create new files and append existing ones
@@ -2853,10 +2892,7 @@ mod tests {
         let path = temp_dir().join("test_run.csv");
         match fs::remove_file(&path) {
             Ok(_) => {}
-            Err(error) => match error.kind() {
-                io::ErrorKind::NotFound => {}
-                _ => panic!("existing temp file couldn't be deleted"),
-            },
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
         };
         let first = SegmentRun {
             deaths: 3,
@@ -2932,36 +2968,34 @@ mod tests {
     /// same option is given twice (and the second instance occurs in the middle)
     #[test]
     fn test_load_input_option_given_twice_middle() {
-        assert!(
-            Input::collect(
-                ["--option2", "--option2", "a", "b", "--option1"]
-                    .into_iter()
-                    .map(String::from)
-            )
-            .is_err_and(|error| match error {
-                Error::OptionProvidedTwice { option } =>
-                    option.as_str() == "--option2",
-                _ => false,
-            })
+        let input = Input::collect(
+            ["--option2", "--option2", "a", "b", "--option1"]
+                .into_iter()
+                .map(String::from),
         );
+        let option = coerce_pattern!(
+            input,
+            Err(Error::OptionProvidedTwice { option }),
+            option
+        );
+        assert_eq!(option.as_str(), "--option2");
     }
 
     /// Tests that the Input::collect function returns the correct error when the
     /// same option is given twice (and the second instance occurs at the end)
     #[test]
     fn test_load_input_option_given_twice_end() {
-        assert!(
-            Input::collect(
-                ["--option1", "--option2", "a", "b", "--option2"]
-                    .into_iter()
-                    .map(String::from)
-            )
-            .is_err_and(|error| match error {
-                Error::OptionProvidedTwice { option } =>
-                    option.as_str() == "--option2",
-                _ => false,
-            })
+        let input = Input::collect(
+            ["--option1", "--option2", "a", "b", "--option2"]
+                .into_iter()
+                .map(String::from),
         );
+        let option = coerce_pattern!(
+            input,
+            Err(Error::OptionProvidedTwice { option }),
+            option
+        );
+        assert_eq!(option.as_str(), "--option2");
     }
 
     /// Tests that an Error is thrown when extract_option_no_values is called
@@ -2974,18 +3008,15 @@ mod tests {
                 .map(String::from),
         )
         .unwrap();
-        assert!(input.extract_option_no_values("--option").is_err_and(
-            |error| match error {
-                Error::OptionExpectedNoValues { option, values } => {
-                    assert_eq!(option.as_str(), "--option");
-                    assert_eq!(values.len(), 2);
-                    assert_eq!(values[0].as_str(), "value1");
-                    assert_eq!(values[1].as_str(), "value2");
-                    true
-                }
-                _ => false,
-            }
-        ));
+        let (option, values) = coerce_pattern!(
+            input.extract_option_no_values("--option"),
+            Err(Error::OptionExpectedNoValues { option, values }),
+            (option, values)
+        );
+        assert_eq!(option.as_str(), "--option");
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].as_str(), "value1");
+        assert_eq!(values[1].as_str(), "value2");
     }
 
     /// Tests that Ok(False) is returned when calling
@@ -3015,12 +3046,13 @@ mod tests {
     fn test_extract_root_no_values_given() {
         let mut input =
             Input::collect([String::from("--root")].into_iter()).unwrap();
-        assert!(input.extract_root(None).is_err_and(|error| match error {
-            Error::OptionExpectedOneValue { option, values } => {
-                (option.as_str() == "--root") && values.is_empty()
-            }
-            _ => false,
-        }));
+        let (option, values) = coerce_pattern!(
+            input.extract_root(None),
+            Err(Error::OptionExpectedOneValue { option, values }),
+            (option, values)
+        );
+        assert_eq!(option.as_str(), "--root");
+        assert!(values.is_empty());
     }
 
     /// Tests that the Input::extract_root function returns the TooManyRootsProvided
@@ -3031,16 +3063,15 @@ mod tests {
             ["--root", "first", "second"].into_iter().map(String::from),
         )
         .unwrap();
-        assert!(input.extract_root(None).is_err_and(|error| match error {
-            Error::OptionExpectedOneValue { option, mut values } => {
-                assert_eq!(option.as_str(), "--root");
-                assert!(values.pop().unwrap().as_str() == "second");
-                assert!(values.pop().unwrap().as_str() == "first");
-                assert!(values.is_empty());
-                true
-            }
-            _ => false,
-        }));
+        let (option, mut values) = coerce_pattern!(
+            input.extract_root(None),
+            Err(Error::OptionExpectedOneValue { option, values }),
+            (option, values)
+        );
+        assert_eq!(option.as_str(), "--root");
+        assert!(values.pop().unwrap().as_str() == "second");
+        assert!(values.pop().unwrap().as_str() == "first");
+        assert!(values.is_empty());
     }
 
     /// Tests that the Input::extract_root function creates a path
@@ -3062,10 +3093,7 @@ mod tests {
     #[test]
     fn test_extract_root_not_passed_empty_home() {
         let mut input = Input::new();
-        assert!(input.extract_root(None).is_err_and(|error| match error {
-            Error::NoRootFound => true,
-            _ => false,
-        }));
+        assert_pattern!(input.extract_root(None), Err(Error::NoRootFound));
     }
 
     /// Tests that the Input::extract_root function returns ~/srtim when
@@ -3091,32 +3119,24 @@ mod tests {
                 String::from("parts"),
             ],
         };
-        assert!(
-            config
-                .add_part(String::from("new"), ConfigPart::Group(segment_group))
-                .is_err_and(|error| match error {
-                    Error::PartsDontExist {
-                        id_name,
-                        display_name,
-                        invalid_parts,
-                    } => {
-                        assert_eq!(id_name.as_str(), "new");
-                        assert_eq!(display_name.as_str(), "new");
-                        let mut invalid_parts = invalid_parts.into_iter();
-                        assert_eq!(
-                            invalid_parts.next().unwrap().as_str(),
-                            "nonexistent"
-                        );
-                        assert_eq!(
-                            invalid_parts.next().unwrap().as_str(),
-                            "parts"
-                        );
-                        assert!(invalid_parts.next().is_none());
-                        true
-                    }
-                    _ => false,
-                })
+        let (id_name, display_name, invalid_parts) = coerce_pattern!(
+            config.add_part(
+                String::from("new"),
+                ConfigPart::Group(segment_group)
+            ),
+            Err(Error::PartsDontExist {
+                id_name,
+                display_name,
+                invalid_parts
+            }),
+            (id_name, display_name, invalid_parts)
         );
+        assert_eq!(id_name.as_str(), "new");
+        assert_eq!(display_name.as_str(), "new");
+        let mut invalid_parts = invalid_parts.into_iter();
+        assert_eq!(invalid_parts.next().unwrap().as_str(), "nonexistent");
+        assert_eq!(invalid_parts.next().unwrap().as_str(), "parts");
+        assert!(invalid_parts.next().is_none());
     }
 
     /// Tests making an invalid config by trying to add a group with parts that don't exist.
@@ -3128,18 +3148,15 @@ mod tests {
                 display_name: String::from("new"),
                 file_name: PathBuf::from("/new.csv"),
             };
-            assert!(
-                config
-                    .add_part(
-                        String::from(id_name_str),
-                        ConfigPart::Segment(segment)
-                    )
-                    .is_err_and(|error| match error {
-                        Error::IdNameInvalid { id_name } =>
-                            id_name.as_str() == id_name_str,
-                        _ => false,
-                    })
+            let id_name = coerce_pattern!(
+                config.add_part(
+                    String::from(id_name_str),
+                    ConfigPart::Segment(segment)
+                ),
+                Err(Error::IdNameInvalid { id_name }),
+                id_name
             );
+            assert_eq!(id_name.as_str(), id_name_str);
         }
     }
 
@@ -3147,29 +3164,15 @@ mod tests {
     #[test]
     fn invalid_config_display_name_with_tab() {
         let invalid_display_name = "has\ttab";
-        assert!(
+        let display_name = coerce_pattern!(
             SegmentInfo::new(
                 String::from(invalid_display_name),
                 PathBuf::from("/new.csv")
-            )
-            .is_err_and(|error| match error {
-                Error::DisplayNameInvalid { display_name } =>
-                    display_name.as_str() == invalid_display_name,
-                _ => false,
-            })
+            ),
+            Err(Error::DisplayNameInvalid { display_name }),
+            display_name
         );
-        assert!(
-            SegmentGroupInfo::new(
-                String::from(invalid_display_name),
-                vec![String::from("a")],
-                PathBuf::from("/new.csv")
-            )
-            .is_err_and(|error| match error {
-                Error::DisplayNameInvalid { display_name } =>
-                    display_name.as_str() == invalid_display_name,
-                _ => false,
-            })
-        );
+        assert_eq!(display_name.as_str(), invalid_display_name);
     }
 
     /// Tests making an invalid config by trying to add a group with parts that don't exist.
@@ -3180,15 +3183,12 @@ mod tests {
             display_name: String::from("new"),
             file_name: PathBuf::from("/new.csv"),
         };
-        assert!(
-            config
-                .add_part(String::from("a"), ConfigPart::Segment(segment))
-                .is_err_and(|error| match error {
-                    Error::IdNameNotUnique { id_name } =>
-                        id_name.as_str() == "a",
-                    _ => false,
-                })
+        let id_name = coerce_pattern!(
+            config.add_part(String::from("a"), ConfigPart::Segment(segment)),
+            Err(Error::IdNameNotUnique { id_name }),
+            id_name
         );
+        assert_eq!(id_name.as_str(), "a");
     }
 
     /// Tests calling Config::load on a directory that doesn't have a config saved
@@ -3207,11 +3207,12 @@ mod tests {
         let root: PathBuf = temp_dir().join("o");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("config.tsv"), &[0b11111111 as u8]).unwrap();
-        assert!(Config::load(root).is_err_and(|error| match error {
-            Error::IOErrorReadingConfig(io_error) =>
-                io_error.kind() == io::ErrorKind::InvalidData,
-            _ => false,
-        }));
+        let io_error = coerce_pattern!(
+            Config::load(root),
+            Err(Error::IOErrorReadingConfig(io_error)),
+            io_error
+        );
+        assert_eq!(io_error.kind(), io::ErrorKind::InvalidData);
     }
 
     /// Tests the output representations of each error values
