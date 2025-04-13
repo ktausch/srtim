@@ -1,6 +1,6 @@
 //! Module containing top level application functions for the binary
 use std::io::{self, Write};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 
 use crate::config::Config;
@@ -247,7 +247,7 @@ where
                     extra_argument: extra_argument.clone(),
                 });
             } else {
-                mode.as_str()
+                mode as &str
             }
         }
         None => return Err(Error::NoModeFound),
@@ -260,7 +260,7 @@ where
         "help" => Ok(custom_output.println(String::from(HELP_MESSAGE))),
         other => {
             return Err(Error::UnknownMode {
-                mode: String::from(other),
+                mode: Arc::from(other),
             });
         }
     }
@@ -342,28 +342,28 @@ mod tests {
         let mut inner_nested_segment_names =
             nested_segment_names.pop().unwrap();
         assert_eq!(inner_nested_segment_names.len(), 2);
-        assert_eq!(inner_nested_segment_names.pop().unwrap().as_str(), "A");
-        assert_eq!(inner_nested_segment_names.pop().unwrap().as_str(), "ABBAA");
+        assert_eq!(&inner_nested_segment_names.pop().unwrap() as &str, "A");
+        assert_eq!(&inner_nested_segment_names.pop().unwrap() as &str, "ABBAA");
         let mut inner_nested_segment_names =
             nested_segment_names.pop().unwrap();
         assert_eq!(inner_nested_segment_names.len(), 2);
-        assert_eq!(inner_nested_segment_names.pop().unwrap().as_str(), "A");
-        assert_eq!(inner_nested_segment_names.pop().unwrap().as_str(), "ABBAA");
+        assert_eq!(&inner_nested_segment_names.pop().unwrap() as &str, "A");
+        assert_eq!(&inner_nested_segment_names.pop().unwrap() as &str, "ABBAA");
         let mut inner_nested_segment_names =
             nested_segment_names.pop().unwrap();
         assert_eq!(inner_nested_segment_names.len(), 2);
-        assert_eq!(inner_nested_segment_names.pop().unwrap().as_str(), "B");
-        assert_eq!(inner_nested_segment_names.pop().unwrap().as_str(), "ABBAA");
+        assert_eq!(&inner_nested_segment_names.pop().unwrap() as &str, "B");
+        assert_eq!(&inner_nested_segment_names.pop().unwrap() as &str, "ABBAA");
         let mut inner_nested_segment_names =
             nested_segment_names.pop().unwrap();
         assert_eq!(inner_nested_segment_names.len(), 2);
-        assert_eq!(inner_nested_segment_names.pop().unwrap().as_str(), "B");
-        assert_eq!(inner_nested_segment_names.pop().unwrap().as_str(), "ABBAA");
+        assert_eq!(&inner_nested_segment_names.pop().unwrap() as &str, "B");
+        assert_eq!(&inner_nested_segment_names.pop().unwrap() as &str, "ABBAA");
         let mut inner_nested_segment_names =
             nested_segment_names.pop().unwrap();
         assert_eq!(inner_nested_segment_names.len(), 2);
-        assert_eq!(inner_nested_segment_names.pop().unwrap().as_str(), "A");
-        assert_eq!(inner_nested_segment_names.pop().unwrap().as_str(), "ABBAA");
+        assert_eq!(&inner_nested_segment_names.pop().unwrap() as &str, "A");
+        assert_eq!(&inner_nested_segment_names.pop().unwrap() as &str, "ABBAA");
         let error = run_application(
             Input::collect(
                 [
@@ -382,12 +382,11 @@ mod tests {
             config,
         );
         assert_eq!(
-            coerce_pattern!(
+            &coerce_pattern!(
                 error,
                 Err(Error::EmptySegmentGroupInfo { display_name }),
                 display_name
-            )
-            .as_str(),
+            ) as &str,
             "C"
         );
     }
@@ -503,19 +502,15 @@ mod tests {
             path: root.join("abbaa.csv"),
         };
         let mut config = Config::new(root);
-        config
-            .add_segment(String::from("a"), String::from("A"))
-            .unwrap();
-        config
-            .add_segment(String::from("b"), String::from("B"))
-            .unwrap();
+        config.add_segment(Arc::from("a"), Arc::from("A")).unwrap();
+        config.add_segment(Arc::from("b"), Arc::from("B")).unwrap();
         config
             .add_segment_group(
-                String::from("abbaa"),
-                String::from("ABBAA"),
+                Arc::from("abbaa"),
+                Arc::from("ABBAA"),
                 ["a", "b", "b", "a", "a"]
                     .into_iter()
-                    .map(String::from)
+                    .map(Arc::from)
                     .collect(),
             )
             .unwrap();
@@ -542,41 +537,36 @@ mod tests {
         run_application_base(input, config, custom_input, &custom_output)
             .unwrap();
         let mut custom_output = custom_output.consume().into_iter();
-        let mut segments =
-            SegmentRun::load_all(&temp_file_a_segment.path).unwrap();
+        let segments = SegmentRun::load_all(&temp_file_a_segment.path).unwrap();
         assert_eq!(segments.len(), 3);
-        let segment = segments.pop().unwrap();
-        assert_eq!(segment.deaths, 0);
-        let third_a_duration = segment.duration();
-        assert!(third_a_duration >= Duration::from_millis(9));
-        let segment = segments.pop().unwrap();
-        assert_eq!(segment.deaths, 3);
-        let second_a_duration = segment.duration();
-        assert!(second_a_duration >= Duration::from_millis(29));
-        let segment = segments.pop().unwrap();
+        let segment = segments[0];
         assert_eq!(segment.deaths, 2);
         let first_a_duration = segment.duration();
         assert!(first_a_duration >= Duration::from_millis(19));
-        assert!(segments.is_empty());
-        let mut segments =
-            SegmentRun::load_all(&temp_file_b_segment.path).unwrap();
-        assert_eq!(segments.len(), 2);
-        let segment = segments.pop().unwrap();
+        let segment = segments[1];
+        assert_eq!(segment.deaths, 3);
+        let second_a_duration = segment.duration();
+        assert!(second_a_duration >= Duration::from_millis(29));
+        let segment = segments[2];
         assert_eq!(segment.deaths, 0);
-        let second_b_duration = segment.duration();
-        assert!(second_b_duration >= Duration::from_millis(24));
-        let segment = segments.pop().unwrap();
+        let third_a_duration = segment.duration();
+        assert!(third_a_duration >= Duration::from_millis(9));
+        let segments = SegmentRun::load_all(&temp_file_b_segment.path).unwrap();
+        assert_eq!(segments.len(), 2);
+        let segment = segments[0];
         assert_eq!(segment.deaths, 1);
         let first_b_duration = segment.duration();
         assert!(first_b_duration >= Duration::from_millis(74));
-        assert!(segments.is_empty());
-        let mut segments =
+        let segment = segments[1];
+        assert_eq!(segment.deaths, 0);
+        let second_b_duration = segment.duration();
+        assert!(second_b_duration >= Duration::from_millis(24));
+        let segments =
             SegmentRun::load_all(&temp_file_segment_group.path).unwrap();
         assert_eq!(segments.len(), 1);
-        let segment = segments.pop().unwrap();
+        let segment = segments[0];
         assert_eq!(segment.deaths, 6);
         assert!(segment.duration() >= Duration::from_millis(159));
-        assert!(segments.is_empty());
         assert_eq!(
             custom_output.next().unwrap(),
             TestOutputMessage {
@@ -686,9 +676,7 @@ mod tests {
             path: root.join("a.csv"),
         };
         let mut config = Config::new(root);
-        config
-            .add_segment(String::from("a"), String::from("A"))
-            .unwrap();
+        config.add_segment(Arc::from("a"), Arc::from("A")).unwrap();
         config.save().unwrap();
         let custom_input = TestCustomInput::new(
             [("\n", 1), ("d\n", 5), ("d\n", 5), ("\n", 10)]
@@ -699,13 +687,12 @@ mod tests {
         run_application_base(input, config, custom_input, &custom_output)
             .unwrap();
         let mut custom_output = custom_output.consume().into_iter();
-        let mut segments =
-            SegmentRun::load_all(&temp_file_a_segment.path).unwrap();
-        let segment = segments.pop().unwrap();
+        let segments = SegmentRun::load_all(&temp_file_a_segment.path).unwrap();
+        assert_eq!(segments.len(), 1);
+        let segment = segments[0];
         assert_eq!(segment.deaths, 2);
         let duration = segment.duration();
         assert!(duration >= Duration::from_millis(19));
-        assert!(segments.is_empty());
         assert_eq!(
             custom_output.next().unwrap(),
             TestOutputMessage {
@@ -739,9 +726,7 @@ mod tests {
         .unwrap();
         let root = temp_dir().join("test_run_part_from_input");
         let mut config = Config::new(root);
-        config
-            .add_segment(String::from("a"), String::from("A"))
-            .unwrap();
+        config.add_segment(Arc::from("a"), Arc::from("A")).unwrap();
         let custom_input = TestCustomInput::new(
             lines
                 .into_iter()
@@ -801,7 +786,7 @@ mod tests {
             Err(Error::TooManyPositionalArguments { extra_argument }),
             extra_argument
         );
-        assert_eq!(extra_argument.as_str(), "second");
+        assert_eq!(&extra_argument as &str, "second");
     }
 
     /// Ensures that run_application returns error if unknown mode is passed
@@ -819,6 +804,6 @@ mod tests {
             Err(Error::UnknownMode { mode }),
             mode
         );
-        assert_eq!(mode.as_str(), "thisisdefinitelynotamode");
+        assert_eq!(&mode as &str, "thisisdefinitelynotamode");
     }
 }
