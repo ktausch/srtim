@@ -1,37 +1,32 @@
 //! Module with struct to handle CLI input, both positional arguments and keyword options
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 
 /// Command line input to any binary
 pub struct Input {
     /// positional arguments supplied from the command line (binary name is first)
-    arguments: Vec<String>,
+    arguments: Arc<[Arc<str>]>,
     /// named arguments supplied from the command line
-    options: HashMap<String, Vec<String>>,
+    options: HashMap<Arc<str>, Arc<[Arc<str>]>>,
 }
 
 impl Input {
-    /// Creates a new empty input
-    fn new() -> Self {
-        Input {
-            arguments: Vec::new(),
-            options: HashMap::new(),
-        }
-    }
-
     /// Gets options and arguments from the given iterator over command line args
     pub fn collect<T: IntoIterator<Item = String>>(args: T) -> Result<Self> {
-        let mut input = Self::new();
-        let mut current_option: Option<(String, Vec<String>)> = None;
+        let mut options = HashMap::new();
+        let mut arguments = Vec::new();
+        let mut current_option: Option<(Arc<str>, Vec<Arc<str>>)> = None;
         for value in args {
+            let value: Arc<str> = value.into();
             current_option = match current_option {
                 Some((current_key, mut current_values)) => {
                     if value.starts_with("--") {
                         let current_key_clone = current_key.clone();
                         if let Some(_) =
-                            input.options.insert(current_key, current_values)
+                            options.insert(current_key, current_values)
                         {
                             return Err(Error::OptionProvidedTwice {
                                 option: current_key_clone,
@@ -47,7 +42,7 @@ impl Input {
                     if value.starts_with("--") {
                         Some((value, Vec::new()))
                     } else {
-                        input.arguments.push(value);
+                        arguments.push(value);
                         None
                     }
                 }
@@ -55,22 +50,29 @@ impl Input {
         }
         if let Some((final_key, final_values)) = current_option {
             let final_key_clone = final_key.clone();
-            if let Some(_) = input.options.insert(final_key, final_values) {
+            if let Some(_) = options.insert(final_key, final_values) {
                 return Err(Error::OptionProvidedTwice {
                     option: final_key_clone,
                 });
             }
         }
-        Ok(input)
+        let mut final_options = HashMap::new();
+        for (key, values) in options {
+            final_options.insert(key, values.into());
+        }
+        Ok(Input {
+            arguments: arguments.into(),
+            options: final_options,
+        })
     }
 
     /// Provides a view to the list of positional arguments provided from command line
-    pub fn arguments(&self) -> &[String] {
+    pub fn arguments(&self) -> &[Arc<str>] {
         &self.arguments
     }
 
     /// Provides a view to the mapping from option name to option values
-    pub fn options(&self) -> &HashMap<String, Vec<String>> {
+    pub fn options(&self) -> &HashMap<Arc<str>, Arc<[Arc<str>]>> {
         &self.options
     }
 
@@ -78,7 +80,7 @@ impl Input {
     pub fn extract_option(
         &mut self,
         option_name: &str,
-    ) -> Option<(String, Vec<String>)> {
+    ) -> Option<(Arc<str>, Arc<[Arc<str>]>)> {
         self.options.remove_entry(option_name)
     }
 
@@ -102,17 +104,17 @@ impl Input {
     pub fn extract_option_single_value(
         &mut self,
         option_name: &str,
-    ) -> Result<String> {
+    ) -> Result<Arc<str>> {
         match self.extract_option(option_name) {
-            Some((option, mut values)) => {
+            Some((option, values)) => {
                 if values.len() != 1 {
                     Err(Error::OptionExpectedOneValue { option, values })
                 } else {
-                    Ok(values.pop().unwrap())
+                    Ok(values[0].clone())
                 }
             }
             None => Err(Error::OptionNotFound {
-                option: String::from(option_name),
+                option: Arc::from(option_name),
             }),
         }
     }
@@ -123,7 +125,7 @@ impl Input {
         home_directory: Option<String>,
     ) -> Result<PathBuf> {
         match self.extract_option_single_value("--root") {
-            Ok(root) => Ok(PathBuf::from(root)),
+            Ok(root) => Ok(PathBuf::from(&root as &str)),
             Err(error) => match &error {
                 Error::OptionExpectedOneValue { .. } => Err(error),
                 _ => match home_directory {
@@ -173,8 +175,8 @@ mod tests {
         let (_, values) = options.remove_entry("--option2").unwrap();
         assert_eq!(values.len(), 2);
         let mut values = values.into_iter();
-        assert_eq!(values.next().unwrap().as_str(), "a");
-        assert_eq!(values.next().unwrap().as_str(), "b");
+        assert_eq!(&values.next().unwrap() as &str, "a");
+        assert_eq!(&values.next().unwrap() as &str, "b");
         assert!(options.is_empty());
     }
 
@@ -187,9 +189,9 @@ mod tests {
                 .unwrap();
         assert!(input.options().is_empty());
         assert_eq!(input.arguments().len(), 3);
-        assert_eq!(input.arguments()[0].as_str(), "a");
-        assert_eq!(input.arguments()[1].as_str(), "b");
-        assert_eq!(input.arguments()[2].as_str(), "c");
+        assert_eq!(&input.arguments()[0] as &str, "a");
+        assert_eq!(&input.arguments()[1] as &str, "b");
+        assert_eq!(&input.arguments()[2] as &str, "c");
     }
 
     /// Tests that the Input::collect function returns the correct error when the
@@ -206,7 +208,7 @@ mod tests {
             Err(Error::OptionProvidedTwice { option }),
             option
         );
-        assert_eq!(option.as_str(), "--option2");
+        assert_eq!(&option as &str, "--option2");
     }
 
     /// Tests that the Input::collect function returns the correct error when the
@@ -223,7 +225,7 @@ mod tests {
             Err(Error::OptionProvidedTwice { option }),
             option
         );
-        assert_eq!(option.as_str(), "--option2");
+        assert_eq!(&option as &str, "--option2");
     }
 
     /// Tests that an Error is thrown when extract_option_no_values is called
@@ -241,10 +243,10 @@ mod tests {
             Err(Error::OptionExpectedNoValues { option, values }),
             (option, values)
         );
-        assert_eq!(option.as_str(), "--option");
+        assert_eq!(&option as &str, "--option");
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0].as_str(), "value1");
-        assert_eq!(values[1].as_str(), "value2");
+        assert_eq!(&values[0] as &str, "value1");
+        assert_eq!(&values[1] as &str, "value2");
     }
 
     /// Tests that Ok(False) is returned when calling
@@ -279,7 +281,7 @@ mod tests {
             Err(Error::OptionExpectedOneValue { option, values }),
             (option, values)
         );
-        assert_eq!(option.as_str(), "--root");
+        assert_eq!(&option as &str, "--root");
         assert!(values.is_empty());
     }
 
@@ -291,15 +293,15 @@ mod tests {
             ["--root", "first", "second"].into_iter().map(String::from),
         )
         .unwrap();
-        let (option, mut values) = coerce_pattern!(
+        let (option, values) = coerce_pattern!(
             input.extract_root(None),
             Err(Error::OptionExpectedOneValue { option, values }),
             (option, values)
         );
-        assert_eq!(option.as_str(), "--root");
-        assert!(values.pop().unwrap().as_str() == "second");
-        assert!(values.pop().unwrap().as_str() == "first");
-        assert!(values.is_empty());
+        assert_eq!(&option as &str, "--root");
+        assert_eq!(values.len(), 2);
+        assert!(&values[0] as &str == "first");
+        assert!(&values[1] as &str == "second");
     }
 
     /// Tests that the Input::extract_root function creates a path
@@ -320,7 +322,8 @@ mod tests {
     /// error when no --root option is found and no home directory is supplied.
     #[test]
     fn test_extract_root_not_passed_empty_home() {
-        let mut input = Input::new();
+        let mut input =
+            Input::collect(([] as [String; 0]).into_iter()).unwrap();
         assert_pattern!(input.extract_root(None), Err(Error::NoRootFound));
     }
 
@@ -328,7 +331,8 @@ mod tests {
     /// no --root option is found but a home directory is supplied.
     #[test]
     fn test_extract_root_not_passed_given_home() {
-        let mut input = Input::new();
+        let mut input =
+            Input::collect(([] as [String; 0]).into_iter()).unwrap();
         let root = input.extract_root(Some(String::from("home"))).unwrap();
         let expected = PathBuf::from("home").join("srtim");
         assert_eq!(root, expected);

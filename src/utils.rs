@@ -2,6 +2,7 @@
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Struct that iterates through two separate iterators to find all the elements on the front that are equal
 struct ZipSame<T, U, V>
@@ -68,8 +69,8 @@ where
 pub fn load_n_tokens<'a>(
     tokens: impl Iterator<Item = &'a str>,
     expected_number: usize,
-) -> std::result::Result<Vec<&'a str>, bool> {
-    let result: Vec<&'a str> = tokens.take(expected_number + 1).collect();
+) -> std::result::Result<Arc<[&'a str]>, bool> {
+    let result: Arc<[&'a str]> = tokens.take(expected_number + 1).collect();
     let length = result.len();
     if length == expected_number {
         Ok(result)
@@ -338,17 +339,17 @@ mod tests {
     /// tokens than expected. In this case Err(true) should be returned.
     #[test]
     fn load_n_tokens_correct_number() {
-        let vector =
+        let tokens =
             load_n_tokens("hello,world,my,name,is,,Keith".split(','), 7)
                 .unwrap();
-        let mut tokens = vector.into_iter();
-        assert_eq!(tokens.next().unwrap(), "hello");
-        assert_eq!(tokens.next().unwrap(), "world");
-        assert_eq!(tokens.next().unwrap(), "my");
-        assert_eq!(tokens.next().unwrap(), "name");
-        assert_eq!(tokens.next().unwrap(), "is");
-        assert_eq!(tokens.next().unwrap(), "");
-        assert_eq!(tokens.next().unwrap(), "Keith");
+        let mut tokens = tokens.into_iter();
+        assert_eq!(*tokens.next().unwrap(), "hello");
+        assert_eq!(*tokens.next().unwrap(), "world");
+        assert_eq!(*tokens.next().unwrap(), "my");
+        assert_eq!(*tokens.next().unwrap(), "name");
+        assert_eq!(*tokens.next().unwrap(), "is");
+        assert_eq!(*tokens.next().unwrap(), "");
+        assert_eq!(*tokens.next().unwrap(), "Keith");
         assert!(tokens.next().is_none());
     }
 

@@ -3,6 +3,7 @@
 //! 2. non-owning-type defining a part of a run in a tree like structure
 use std::collections::{HashMap, hash_map::Entry};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
@@ -16,7 +17,7 @@ use crate::utils::zip_same;
 fn check_display_name(display_name: &str) -> Result<()> {
     if display_name.contains('\t') {
         Err(Error::DisplayNameInvalid {
-            display_name: String::from(display_name),
+            display_name: Arc::from(display_name),
         })
     } else {
         Ok(())
@@ -27,7 +28,7 @@ fn check_display_name(display_name: &str) -> Result<()> {
 /// should be displayed and the file in which its information is stored.
 pub struct SegmentInfo {
     /// name that should be displayed for this segment
-    pub display_name: String,
+    pub display_name: Arc<str>,
     /// absolute path to file containing this segment's info
     pub file_name: PathBuf,
 }
@@ -35,7 +36,7 @@ pub struct SegmentInfo {
 impl SegmentInfo {
     /// Creates a new SegmentInfo, ensuring that file_name is an absolute path
     pub fn new(
-        display_name: String,
+        display_name: Arc<str>,
         file_name: PathBuf,
     ) -> Result<SegmentInfo> {
         check_display_name(&display_name)?;
@@ -53,9 +54,9 @@ impl SegmentInfo {
 /// Struct to store the owned specification of a segment group
 pub struct SegmentGroupInfo {
     /// name that should be displayed for this group
-    pub display_name: String,
+    pub display_name: Arc<str>,
     /// non-empty list of ID names of the parts that make up this group
-    pub part_id_names: Vec<String>,
+    pub part_id_names: Arc<[Arc<str>]>,
     /// absolute path to file containing information about this group's runs
     pub file_name: PathBuf,
 }
@@ -63,8 +64,8 @@ pub struct SegmentGroupInfo {
 impl SegmentGroupInfo {
     /// Creates a new SegmentGroupInfo, ensuring file_name is an absolute path and part_id_names is non-empty
     pub fn new(
-        display_name: String,
-        part_id_names: Vec<String>,
+        display_name: Arc<str>,
+        part_id_names: Arc<[Arc<str>]>,
         file_name: PathBuf,
     ) -> Result<SegmentGroupInfo> {
         check_display_name(&display_name)?;
@@ -88,8 +89,8 @@ pub enum RunPart<'a> {
     SingleSegment(&'a SegmentInfo),
     /// part of a run that is a (possibly nested) group of segments
     Group {
-        components: Vec<&'a RunPart<'a>>,
-        display_name: &'a str,
+        components: Arc<[&'a RunPart<'a>]>,
+        display_name: Arc<str>,
         file_name: &'a Path,
     },
 }
@@ -103,15 +104,16 @@ pub enum RunPart<'a> {
 /// [(0, ((AB)C)), (0, (AB)), (1, B)],
 /// [(0, ((AB)C)), (1, C)],
 /// [(1, D)]
-fn nested_segment_specs_from_parts_vec<'a>(
-    components: &'a Vec<&'a RunPart<'a>>,
+fn nested_segment_specs_from_parts_slice<'a>(
+    components: &'a [&'a RunPart<'a>],
 ) -> Vec<Vec<(usize, &'a RunPart<'a>)>> {
-    let mut result: Vec<Vec<(usize, &'a RunPart<'a>)>> = Vec::new();
+    let mut result = Vec::new();
     for (index, component) in components.iter().enumerate() {
         match component {
             RunPart::Group { components, .. } => {
                 let mut leaves =
-                    nested_segment_specs_from_parts_vec(components).into_iter();
+                    nested_segment_specs_from_parts_slice(components)
+                        .into_iter();
                 while let Some(leaf) = leaves.next() {
                     let mut full_segment_spec = vec![(index, *component)];
                     let mut nodes = leaf.into_iter();
@@ -132,7 +134,7 @@ fn nested_segment_specs_from_parts_vec<'a>(
 /// Owned display and path names for a given run part
 pub struct PartCore {
     /// the human-readable name of the part
-    pub display_name: String,
+    pub display_name: Arc<str>,
     /// the path where the part's runs are stored
     pub file_name: PathBuf,
     /// which instance of this part it is in the part above it
@@ -149,11 +151,11 @@ impl PartialEq for PartCore {
 
 impl<'a> RunPart<'a> {
     /// Gets the display name of the part, whether it is a segment or a segment group
-    pub fn display_name(&'a self) -> &'a str {
+    pub fn display_name(&'a self) -> &'a Arc<str> {
         match self {
-            &RunPart::Group { display_name, .. } => display_name,
-            &RunPart::SingleSegment(SegmentInfo { display_name, .. }) => {
-                display_name.as_str()
+            RunPart::Group { display_name, .. } => display_name,
+            RunPart::SingleSegment(SegmentInfo { display_name, .. }) => {
+                display_name
             }
         }
     }
@@ -174,7 +176,7 @@ impl<'a> RunPart<'a> {
     ) -> Vec<Vec<(usize, &'a RunPart<'a>)>> {
         match self {
             RunPart::Group { components, .. } => {
-                nested_segment_specs_from_parts_vec(components)
+                nested_segment_specs_from_parts_slice(components)
             }
             _ => vec![],
         }
@@ -192,7 +194,7 @@ impl<'a> RunPart<'a> {
                 segment_spec
                     .into_iter()
                     .map(|(index, part)| PartCore {
-                        display_name: String::from(part.display_name()),
+                        display_name: part.display_name().clone(),
                         file_name: PathBuf::from(part.file_name()),
                         index,
                     })
@@ -251,7 +253,7 @@ impl<'a> RunPart<'a> {
             0 => 1usize,
             num_segments => num_segments,
         };
-        let top_level_name = String::from(self.display_name());
+        let top_level_name = self.display_name().clone();
         let top_level_path = PathBuf::from(self.file_name());
         let mut maybe_top_level_accumulation: Option<SegmentRun> = None;
         let tagging_thread = thread::spawn(move || {
@@ -260,7 +262,8 @@ impl<'a> RunPart<'a> {
                 Some(last_segment_names) => last_segment_names,
                 None => vec![],
             };
-            let mut accumulations: HashMap<String, SegmentRun> = HashMap::new();
+            let mut accumulations: HashMap<Arc<str>, SegmentRun> =
+                HashMap::new();
             loop {
                 let next_segment_names = match nested_segment_names.next() {
                     Some(next_segment_names) => next_segment_names,
@@ -368,14 +371,13 @@ mod tests {
     use super::*;
     use std::ptr;
 
-    use crate::{assert_pattern, coerce_pattern};
+    use crate::coerce_pattern;
 
     /// Ensures that SegmentInfo requires an absolute path file_name
     #[test]
     fn segment_info_no_absolute_path() {
         assert!(
-            SegmentInfo::new(String::from("A"), PathBuf::from("A.txt"))
-                .is_err()
+            SegmentInfo::new(Arc::from("A"), PathBuf::from("A.txt")).is_err()
         );
     }
 
@@ -384,8 +386,8 @@ mod tests {
     fn segment_group_info_no_absolute_path() {
         assert!(
             SegmentGroupInfo::new(
-                String::from("A"),
-                vec![String::from("a")],
+                Arc::from("A"),
+                Arc::from([Arc::from("a")]),
                 PathBuf::from("A.txt")
             )
             .is_err()
@@ -397,8 +399,8 @@ mod tests {
     fn segment_group_info_no_parts() {
         assert!(
             SegmentGroupInfo::new(
-                String::from("A"),
-                Vec::new(),
+                Arc::from("A"),
+                Arc::from([]),
                 PathBuf::from("/A.txt")
             )
             .is_err()
@@ -408,37 +410,37 @@ mod tests {
     /// Test making a run with 5 segments, ABCDE where ABC and DE are sub groups.
     #[test]
     fn make_run() {
-        let a = SegmentInfo::new(String::from("A"), PathBuf::from("/A.txt"))
-            .unwrap();
+        let a =
+            SegmentInfo::new(Arc::from("A"), PathBuf::from("/A.txt")).unwrap();
         let ap = RunPart::SingleSegment(&a);
-        let b = SegmentInfo::new(String::from("B"), PathBuf::from("/B.txt"))
-            .unwrap();
+        let b =
+            SegmentInfo::new(Arc::from("B"), PathBuf::from("/B.txt")).unwrap();
         let bp = RunPart::SingleSegment(&b);
-        let c = SegmentInfo::new(String::from("C"), PathBuf::from("/C.txt"))
-            .unwrap();
+        let c =
+            SegmentInfo::new(Arc::from("C"), PathBuf::from("/C.txt")).unwrap();
         let cp = RunPart::SingleSegment(&c);
-        let d = SegmentInfo::new(String::from("D"), PathBuf::from("/D.txt"))
-            .unwrap();
+        let d =
+            SegmentInfo::new(Arc::from("D"), PathBuf::from("/D.txt")).unwrap();
         let dp = RunPart::SingleSegment(&d);
-        let e = SegmentInfo::new(String::from("E"), PathBuf::from("/E.txt"))
-            .unwrap();
+        let e =
+            SegmentInfo::new(Arc::from("E"), PathBuf::from("/E.txt")).unwrap();
         let ep = RunPart::SingleSegment(&e);
         let abc_file_name = PathBuf::from("ABC.txt");
         let abcp = RunPart::Group {
-            components: vec![&ap, &bp, &cp],
-            display_name: "ABC",
+            components: Arc::from([&ap, &bp, &cp]),
+            display_name: Arc::from("ABC"),
             file_name: &abc_file_name,
         };
         let de_file_name = PathBuf::from("DE.txt");
         let dep = RunPart::Group {
-            components: vec![&dp, &ep],
-            display_name: "DE",
+            components: Arc::from([&dp, &ep]),
+            display_name: Arc::from("DE"),
             file_name: &de_file_name,
         };
         let abcde_file_name = PathBuf::from("ABCDE.txt");
         let run = RunPart::Group {
-            components: vec![&abcp, &dep],
-            display_name: "ABCDE",
+            components: Arc::from([&abcp, &dep]),
+            display_name: Arc::from("ABCDE"),
             file_name: &abcde_file_name,
         };
         let mut iter = run.run_segments().into_iter();
@@ -455,118 +457,120 @@ mod tests {
     /// RunInfo::segments function produce the expected references.
     #[test]
     fn nested_segment_specs_test() {
-        let a = SegmentInfo::new(String::from("A"), PathBuf::from("/A.txt"))
-            .unwrap();
+        let a =
+            SegmentInfo::new(Arc::from("A"), PathBuf::from("/A.txt")).unwrap();
         let ap = RunPart::SingleSegment(&a);
-        let b = SegmentInfo::new(String::from("B"), PathBuf::from("/B.txt"))
-            .unwrap();
+        let b =
+            SegmentInfo::new(Arc::from("B"), PathBuf::from("/B.txt")).unwrap();
         let bp = RunPart::SingleSegment(&b);
-        let c = SegmentInfo::new(String::from("C"), PathBuf::from("/C.txt"))
-            .unwrap();
+        let c =
+            SegmentInfo::new(Arc::from("C"), PathBuf::from("/C.txt")).unwrap();
         let cp = RunPart::SingleSegment(&c);
-        let d = SegmentInfo::new(String::from("D"), PathBuf::from("/D.txt"))
-            .unwrap();
+        let d =
+            SegmentInfo::new(Arc::from("D"), PathBuf::from("/D.txt")).unwrap();
         let dp = RunPart::SingleSegment(&d);
         let abf = PathBuf::from("/AB.txt");
         let abp = RunPart::Group {
-            components: vec![&ap, &bp],
-            display_name: "AB",
+            components: Arc::from([&ap, &bp]),
+            display_name: Arc::from("AB"),
             file_name: &abf,
         };
         let abcf = PathBuf::from("/ABC.txt");
         let abcp = RunPart::Group {
-            components: vec![&abp, &cp],
-            display_name: "ABC",
+            components: Arc::from([&abp, &cp]),
+            display_name: Arc::from("ABC"),
             file_name: &abcf,
         };
         let abcdf = PathBuf::from("/ABCD.txt");
         let run_part = RunPart::Group {
-            components: vec![&abcp, &dp],
-            display_name: "ABCD",
+            components: Arc::from([&abcp, &dp]),
+            display_name: Arc::from("ABCD"),
             file_name: &abcdf,
         };
         let mut segment_specs = run_part.nested_segment_specs().into_iter();
         let mut a_spec = segment_specs.next().unwrap().into_iter();
         let (index, a_part) = a_spec.next().unwrap();
         assert_eq!(index, 0);
-        assert_pattern!(
-            a_part,
-            &RunPart::Group {
-                display_name: "ABC",
-                ..
-            }
-        );
-        let (index, a_part) = a_spec.next().unwrap();
-        assert_eq!(index, 0);
-        assert_pattern!(
-            a_part,
-            &RunPart::Group {
-                display_name: "AB",
-                ..
-            }
+        assert_eq!(
+            coerce_pattern!(
+                a_part,
+                RunPart::Group { display_name, .. },
+                display_name
+            ) as &str,
+            "ABC"
         );
         let (index, a_part) = a_spec.next().unwrap();
         assert_eq!(index, 0);
         assert_eq!(
             coerce_pattern!(
                 a_part,
-                &RunPart::SingleSegment(SegmentInfo { display_name, .. }),
+                RunPart::Group { display_name, .. },
                 display_name
-            )
-            .as_str(),
+            ) as &str,
+            "AB"
+        );
+        let (index, a_part) = a_spec.next().unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(
+            coerce_pattern!(
+                a_part,
+                RunPart::SingleSegment(SegmentInfo { display_name, .. }),
+                display_name
+            ) as &str,
             "A"
         );
         assert!(a_spec.next().is_none());
         let mut b_spec = segment_specs.next().unwrap().into_iter();
         let (index, b_part) = b_spec.next().unwrap();
         assert_eq!(index, 0);
-        assert_pattern!(
-            b_part,
-            &RunPart::Group {
-                display_name: "ABC",
-                ..
-            }
+        assert_eq!(
+            coerce_pattern!(
+                b_part,
+                RunPart::Group { display_name, .. },
+                display_name
+            ) as &str,
+            "ABC"
         );
         let (index, b_part) = b_spec.next().unwrap();
         assert_eq!(index, 0);
-        assert_pattern!(
-            b_part,
-            &RunPart::Group {
-                display_name: "AB",
-                ..
-            }
+        assert_eq!(
+            coerce_pattern!(
+                b_part,
+                RunPart::Group { display_name, .. },
+                display_name
+            ) as &str,
+            "AB"
         );
         let (index, b_part) = b_spec.next().unwrap();
         assert_eq!(index, 1);
         assert_eq!(
-            coerce_pattern!(
+            &coerce_pattern!(
                 b_part,
                 &RunPart::SingleSegment(SegmentInfo { display_name, .. }),
                 display_name
-            )
-            .as_str(),
+            ) as &str,
             "B"
         );
         assert!(b_spec.next().is_none());
         let mut c_spec = segment_specs.next().unwrap().into_iter();
         let (index, c_part) = c_spec.next().unwrap();
         assert_eq!(index, 0);
-        assert_pattern!(
-            c_part,
-            &RunPart::Group {
-                display_name: "ABC",
-                ..
-            }
+        assert_eq!(
+            coerce_pattern!(
+                c_part,
+                RunPart::Group { display_name, .. },
+                display_name
+            ) as &str,
+            "ABC"
         );
         let (index, c_part) = c_spec.next().unwrap();
         assert_eq!(index, 1);
         assert_eq!(
-            coerce_pattern!(
+            &coerce_pattern!(
                 c_part,
                 &RunPart::SingleSegment(SegmentInfo { display_name, .. }),
                 display_name
-            )
-            .as_str(),
+            ) as &str,
             "C"
         );
         assert!(c_spec.next().is_none());
@@ -574,12 +578,11 @@ mod tests {
         let (index, d_part) = d_spec.next().unwrap();
         assert_eq!(index, 1);
         assert_eq!(
-            coerce_pattern!(
+            &coerce_pattern!(
                 d_part,
                 &RunPart::SingleSegment(SegmentInfo { display_name, .. }),
                 display_name
-            )
-            .as_str(),
+            ) as &str,
             "D"
         );
         assert!(d_spec.next().is_none());

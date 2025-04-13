@@ -3,7 +3,10 @@ use std::fmt::{self, Debug, Display};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{
+    Arc,
+    mpsc::{Receiver, Sender},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
@@ -188,7 +191,7 @@ impl SegmentRun {
     }
 
     /// Loads all SegmentRun objects stored in a csv file.
-    pub fn load_all(path: &Path) -> Result<Vec<SegmentRun>> {
+    pub fn load_all(path: &Path) -> Result<Arc<[SegmentRun]>> {
         let contents = fs::read_to_string(path).map_err(|error| {
             Error::CouldNotReadSegmentRunFile {
                 path: path.to_path_buf(),
@@ -226,7 +229,7 @@ impl SegmentRun {
             })?;
             result.push(SegmentRun { start, end, deaths });
         }
-        Ok(result)
+        Ok(result.into())
     }
 }
 
@@ -235,7 +238,7 @@ pub struct SupplementedSegmentRun {
     /// nesting level of the part that was just completed (how many groups into the run this is)
     pub nesting: u8,
     /// the name of the run part (either segment or group) that was completed
-    pub name: String,
+    pub name: Arc<str>,
     /// number of deaths and start and end times of the part that was just completed
     pub segment_run: SegmentRun,
 }

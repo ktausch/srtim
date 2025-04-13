@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
 use crate::coerce_pattern;
@@ -24,7 +25,7 @@ enum ConfigPart {
 
 impl ConfigPart {
     /// Gets the display name of the part
-    fn display_name(&self) -> &String {
+    fn display_name(&self) -> &Arc<str> {
         match self {
             ConfigPart::Segment(segment_info) => &segment_info.display_name,
             ConfigPart::Group(segment_group_info) => {
@@ -37,7 +38,7 @@ impl ConfigPart {
 /// top-level config that works as a pool for all segments and segment groups
 pub struct Config {
     root: PathBuf,
-    parts: HashMap<String, ConfigPart>,
+    parts: HashMap<Arc<str>, ConfigPart>,
 }
 
 impl Config {
@@ -62,7 +63,7 @@ impl Config {
     /// 1. the ID name is already taken
     /// 2. components of a segment group are not yet defined
     /// 3. the ID name has the special component separator (':'), which is not allowed
-    fn add_part(&mut self, id_name: String, part: ConfigPart) -> Result<()> {
+    fn add_part(&mut self, id_name: Arc<str>, part: ConfigPart) -> Result<()> {
         if id_name.contains(COMPONENT_SEPARATOR) || id_name.contains('\t') {
             return Err(Error::IdNameInvalid {
                 id_name,
@@ -97,8 +98,8 @@ impl Config {
     /// Adds info about a segment to the config
     pub fn add_segment(
         &mut self,
-        id_name: String,
-        display_name: String,
+        id_name: Arc<str>,
+        display_name: Arc<str>,
     ) -> Result<()> {
         let file_name = self.root.join(format!("{}.csv", id_name));
         let segment = SegmentInfo::new(display_name, file_name)?;
@@ -108,9 +109,9 @@ impl Config {
     /// Adds info about a segment group to the config
     pub fn add_segment_group(
         &mut self,
-        id_name: String,
-        display_name: String,
-        part_id_names: Vec<String>,
+        id_name: Arc<str>,
+        display_name: Arc<str>,
+        part_id_names: Arc<[Arc<str>]>,
     ) -> Result<()> {
         let file_name = self.root.join(format!("{}.csv", id_name));
         let segment_group =
@@ -132,14 +133,14 @@ impl Config {
             expected_number_of_elements,
         })?;
         let mut iter = elements.into_iter();
-        let id_name = String::from(iter.next().unwrap());
-        let display_name = String::from(iter.next().unwrap());
-        let part_id_names: Vec<String> = iter
+        let id_name = Arc::from(*iter.next().unwrap());
+        let display_name = Arc::from(*iter.next().unwrap());
+        let part_id_names: Arc<[Arc<str>]> = iter
             .next()
             .unwrap()
             .split(COMPONENT_SEPARATOR)
             .filter(|s| !s.is_empty())
-            .map(|p| String::from(p))
+            .map(|p| Arc::from(p))
             .collect();
         match part_id_names.len() {
             0 => self.add_segment(id_name, display_name),
@@ -181,7 +182,7 @@ impl Config {
         in_queue.reserve(self.parts.len());
         while queue.len() < self.parts.len() {
             for (id_name, part_info) in &self.parts {
-                let id_name = id_name.as_str();
+                let id_name = id_name as &str;
                 if !in_queue.contains(id_name) {
                     let should_add = match part_info {
                         ConfigPart::Segment(_) => true,
@@ -189,7 +190,7 @@ impl Config {
                             part_id_names,
                             ..
                         }) => part_id_names.iter().all(|part_id_name| {
-                            in_queue.contains(part_id_name.as_str())
+                            in_queue.contains(part_id_name as &str)
                         }),
                     };
                     if should_add {
@@ -282,7 +283,7 @@ where
 
     /// Makes a level of the SegmentPool from named ConfigParts, their orders, and the previous levels
     fn make_level<'y, 'z, const N: usize>(
-        parts: &'y HashMap<String, ConfigPart>,
+        parts: &'y HashMap<Arc<str>, ConfigPart>,
         order: &'z HashMap<&'y str, usize>,
         existing: [(&'z HashMap<&'y str, usize>, &'z Vec<RunPart<'z>>); N],
     ) -> (HashMap<&'y str, usize>, Vec<RunPart<'z>>)
@@ -319,8 +320,8 @@ where
                         );
                         let mut components =
                             Vec::with_capacity(part_id_names.len());
-                        for part_id_name in part_id_names {
-                            let part_id_name = part_id_name.as_str();
+                        for part_id_name in part_id_names as &[Arc<str>] {
+                            let part_id_name = part_id_name as &str;
                             let this_order = order[part_id_name];
                             let (existing_indices, existing_level) =
                                 existing[this_order];
@@ -329,8 +330,8 @@ where
                             );
                         }
                         new.push(RunPart::Group {
-                            display_name: display_name.as_str(),
-                            components,
+                            display_name: display_name.clone(),
+                            components: components.into(),
                             file_name: file_name.as_path(),
                         });
                     }
@@ -367,8 +368,8 @@ impl<'a> Config {
                 }) => {
                     let mut order: usize = 0;
                     let mut to_push: Vec<&'a str> = Vec::new();
-                    for part_id_name in part_id_names {
-                        let part_id_name = part_id_name.as_str();
+                    for part_id_name in part_id_names as &[Arc<str>] {
+                        let part_id_name = part_id_name as &str;
                         match result.get(part_id_name) {
                             Some(&sub_order) => {
                                 let minimum_order = 1 + sub_order;
@@ -400,7 +401,7 @@ impl<'a> Config {
     {
         let order =
             self.order(id_name).ok_or_else(|| Error::IdNameNotFound {
-                id_name: String::from(id_name),
+                id_name: Arc::from(id_name),
             })?;
         if order.iter().map(|(_, &order)| order).max().unwrap()
             > SegmentPool::MAX_NESTING_LEVEL
@@ -464,7 +465,7 @@ impl<'a> Config {
     pub fn nested_segment_names(
         &self,
         id_name: &str,
-    ) -> Result<Vec<Vec<String>>> {
+    ) -> Result<Vec<Vec<Arc<str>>>> {
         let inner = self.use_run_info(id_name, |run_part| {
             run_part.nested_segment_names()
         })?;
@@ -526,92 +527,64 @@ mod tests {
     /// Makes a config containing 5 segments, A-E, and three groups, (AB), ((AB)C), and (((AB)C)D)
     fn make_abcd_config(extra: &str) -> (Config, TempFile) {
         let mut config = Config::new(temp_dir().join(extra));
-        assert!(
-            config
-                .add_segment(String::from("b"), String::from("B"))
-                .is_ok()
-        );
-        assert!(
-            config
-                .add_segment(String::from("a"), String::from("A"))
-                .is_ok()
-        );
+        assert!(config.add_segment(Arc::from("b"), Arc::from("B")).is_ok());
+        assert!(config.add_segment(Arc::from("a"), Arc::from("A")).is_ok());
         assert!(
             config
                 .add_segment_group(
-                    String::from("ab"),
-                    String::from("AB"),
-                    vec![String::from("a"), String::from("b")]
+                    Arc::from("ab"),
+                    Arc::from("AB"),
+                    Arc::from([Arc::from("a"), Arc::from("b")])
                 )
                 .is_ok()
         );
-        assert!(
-            config
-                .add_segment(String::from("d"), String::from("D"))
-                .is_ok()
-        );
-        assert!(
-            config
-                .add_segment(String::from("c"), String::from("C"))
-                .is_ok()
-        );
+        assert!(config.add_segment(Arc::from("d"), Arc::from("D")).is_ok());
+        assert!(config.add_segment(Arc::from("c"), Arc::from("C")).is_ok());
         assert!(
             config
                 .add_segment_group(
-                    String::from("abc"),
-                    String::from("ABC"),
-                    vec![String::from("ab"), String::from("c")]
+                    Arc::from("abc"),
+                    Arc::from("ABC"),
+                    Arc::from([Arc::from("ab"), Arc::from("c")])
                 )
                 .is_ok()
         );
-        assert!(
-            config
-                .add_segment(String::from("e"), String::from("E"))
-                .is_ok()
-        );
+        assert!(config.add_segment(Arc::from("e"), Arc::from("E")).is_ok());
         assert!(
             config
                 .add_segment_group(
-                    String::from("abcd"),
-                    String::from("ABCD"),
-                    vec![String::from("abc"), String::from("d")]
+                    Arc::from("abcd"),
+                    Arc::from("ABCD"),
+                    Arc::from([Arc::from("abc"), Arc::from("d")])
                 )
                 .is_ok()
         );
-        assert!(
-            config
-                .add_segment(String::from("f"), String::from("F"))
-                .is_ok()
-        );
+        assert!(config.add_segment(Arc::from("f"), Arc::from("F")).is_ok());
         assert!(
             config
                 .add_segment_group(
-                    String::from("abcdf"),
-                    String::from("ABCDF"),
-                    vec![String::from("abcd"), String::from("f")]
+                    Arc::from("abcdf"),
+                    Arc::from("ABCDF"),
+                    Arc::from([Arc::from("abcd"), Arc::from("f")])
                 )
                 .is_ok()
         );
-        assert!(
-            config
-                .add_segment(String::from("g"), String::from("G"))
-                .is_ok()
-        );
+        assert!(config.add_segment(Arc::from("g"), Arc::from("G")).is_ok());
         assert!(
             config
                 .add_segment_group(
-                    String::from("abcdfg"),
-                    String::from("ABCDFG"),
-                    vec![String::from("abcdf"), String::from("g")]
+                    Arc::from("abcdfg"),
+                    Arc::from("ABCDFG"),
+                    Arc::from([Arc::from("abcdf"), Arc::from("g")])
                 )
                 .is_ok()
         );
         assert!(
             config
                 .add_segment_group(
-                    String::from("ababc"),
-                    String::from("ABABC"),
-                    vec![String::from("ab"), String::from("abc")]
+                    Arc::from("ababc"),
+                    Arc::from("ABABC"),
+                    Arc::from([Arc::from("ab"), Arc::from("abc")])
                 )
                 .is_ok()
         );
@@ -634,7 +607,7 @@ mod tests {
             config.nested_segment_names("a").unwrap().into_iter();
         let mut inner_segment_names =
             nested_segment_names.next().unwrap().into_iter();
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "A");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "A");
         assert!(inner_segment_names.next().is_none());
         assert!(nested_segment_names.next().is_none());
     }
@@ -648,28 +621,28 @@ mod tests {
             config.nested_segment_names("abcd").unwrap().into_iter();
         let mut inner_segment_names =
             nested_segment_names.next().unwrap().into_iter();
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "ABCD");
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "ABC");
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "AB");
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "A");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "ABCD");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "ABC");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "AB");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "A");
         assert!(inner_segment_names.next().is_none());
         let mut inner_segment_names =
             nested_segment_names.next().unwrap().into_iter();
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "ABCD");
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "ABC");
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "AB");
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "B");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "ABCD");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "ABC");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "AB");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "B");
         assert!(inner_segment_names.next().is_none());
         let mut inner_segment_names =
             nested_segment_names.next().unwrap().into_iter();
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "ABCD");
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "ABC");
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "C");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "ABCD");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "ABC");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "C");
         assert!(inner_segment_names.next().is_none());
         let mut inner_segment_names =
             nested_segment_names.next().unwrap().into_iter();
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "ABCD");
-        assert_eq!(inner_segment_names.next().unwrap().as_str(), "D");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "ABCD");
+        assert_eq!(&inner_segment_names.next().unwrap() as &str, "D");
         assert!(inner_segment_names.next().is_none());
         assert!(nested_segment_names.next().is_none());
     }
@@ -736,30 +709,30 @@ mod tests {
                     .nested_segment_specs()
                     .into_iter()
                     .map(|v| {
-                        let mut output: String =
-                            String::from(run_info.display_name());
+                        let mut output =
+                            String::from(run_info.display_name() as &str);
                         for (_, p) in v {
                             output.push(':');
                             output.push_str(match p {
                                 RunPart::SingleSegment(SegmentInfo {
                                     display_name,
                                     ..
-                                }) => display_name.as_str(),
+                                }) => display_name,
                                 RunPart::Group { display_name, .. } => {
                                     display_name
                                 }
                             });
                         }
-                        output
+                        output.into()
                     })
-                    .collect::<Vec<String>>()
+                    .collect::<Vec<Arc<str>>>()
             })
             .unwrap()
             .into_iter();
-        assert_eq!(segment_names.next().unwrap().as_str(), "ABCD:ABC:AB:A");
-        assert_eq!(segment_names.next().unwrap().as_str(), "ABCD:ABC:AB:B");
-        assert_eq!(segment_names.next().unwrap().as_str(), "ABCD:ABC:C");
-        assert_eq!(segment_names.next().unwrap().as_str(), "ABCD:D");
+        assert_eq!(&segment_names.next().unwrap() as &str, "ABCD:ABC:AB:A");
+        assert_eq!(&segment_names.next().unwrap() as &str, "ABCD:ABC:AB:B");
+        assert_eq!(&segment_names.next().unwrap() as &str, "ABCD:ABC:C");
+        assert_eq!(&segment_names.next().unwrap() as &str, "ABCD:D");
         assert!(segment_names.next().is_none());
     }
 
@@ -775,14 +748,14 @@ mod tests {
                     .into_iter()
                     .map(|v| {
                         let mut output: String =
-                            String::from(run_info.display_name());
+                            String::from(run_info.display_name() as &str);
                         for (_, p) in v {
                             output.push(':');
                             output.push_str(match p {
                                 RunPart::SingleSegment(SegmentInfo {
                                     display_name,
                                     ..
-                                }) => display_name.as_str(),
+                                }) => display_name,
                                 RunPart::Group { display_name, .. } => {
                                     display_name
                                 }
@@ -812,12 +785,12 @@ mod tests {
                 run_info
                     .run_segments()
                     .into_iter()
-                    .map(|s| String::from(&s.display_name))
-                    .collect::<Vec<String>>()
+                    .map(|s| Arc::from(&s.display_name as &str))
+                    .collect::<Vec<Arc<str>>>()
             })
             .unwrap()
             .into_iter();
-        assert_eq!(segment_names.next().unwrap().as_str(), "E");
+        assert_eq!(&segment_names.next().unwrap() as &str, "E");
         assert!(segment_names.next().is_none());
     }
 
@@ -857,7 +830,7 @@ mod tests {
             } = supplemented_segment_run_receiver.recv().unwrap();
             assert_eq!(segment_run.deaths, 2);
             assert!(segment_run.duration() >= Duration::from_millis(40));
-            assert_eq!(&name, group_display_name);
+            assert_eq!(&name as &str, group_display_name);
             assert_eq!(nesting, 0);
             assert!(supplemented_segment_run_receiver.recv().is_err());
         });
@@ -932,7 +905,7 @@ mod tests {
                 segment_run,
             } = supplemented_segment_run_receiver.recv().unwrap();
             assert_eq!(nesting, 2);
-            assert_eq!(&name, "A");
+            assert_eq!(&name as &str, "A");
             assert_eq!(segment_run.deaths, 1);
             assert!(segment_run.duration() >= Duration::from_millis(30));
             let SupplementedSegmentRun {
@@ -941,7 +914,7 @@ mod tests {
                 segment_run,
             } = supplemented_segment_run_receiver.recv().unwrap();
             assert_eq!(nesting, 2);
-            assert_eq!(&name, "B");
+            assert_eq!(&name as &str, "B");
             assert_eq!(segment_run.deaths, 2);
             assert!(segment_run.duration() >= Duration::from_millis(35));
             let SupplementedSegmentRun {
@@ -950,7 +923,7 @@ mod tests {
                 segment_run,
             } = supplemented_segment_run_receiver.recv().unwrap();
             assert_eq!(nesting, 1);
-            assert_eq!(&name, "AB");
+            assert_eq!(&name as &str, "AB");
             assert_eq!(segment_run.deaths, 3);
             assert!(segment_run.duration() >= Duration::from_millis(65));
             let SupplementedSegmentRun {
@@ -959,7 +932,7 @@ mod tests {
                 segment_run,
             } = supplemented_segment_run_receiver.recv().unwrap();
             assert_eq!(nesting, 3);
-            assert_eq!(&name, "A");
+            assert_eq!(&name as &str, "A");
             assert_eq!(segment_run.deaths, 0);
             assert!(segment_run.duration() >= Duration::from_millis(15));
             let SupplementedSegmentRun {
@@ -968,7 +941,7 @@ mod tests {
                 segment_run,
             } = supplemented_segment_run_receiver.recv().unwrap();
             assert_eq!(nesting, 3);
-            assert_eq!(&name, "B");
+            assert_eq!(&name as &str, "B");
             assert_eq!(segment_run.deaths, 3);
             assert!(segment_run.duration() >= Duration::from_millis(50));
             let SupplementedSegmentRun {
@@ -977,7 +950,7 @@ mod tests {
                 segment_run,
             } = supplemented_segment_run_receiver.recv().unwrap();
             assert_eq!(nesting, 2);
-            assert_eq!(&name, "AB");
+            assert_eq!(&name as &str, "AB");
             assert_eq!(segment_run.deaths, 3);
             assert!(segment_run.duration() >= Duration::from_millis(65));
             let SupplementedSegmentRun {
@@ -986,7 +959,7 @@ mod tests {
                 segment_run,
             } = supplemented_segment_run_receiver.recv().unwrap();
             assert_eq!(nesting, 2);
-            assert_eq!(&name, "C");
+            assert_eq!(&name as &str, "C");
             assert_eq!(segment_run.deaths, 0);
             assert!(segment_run.duration() >= Duration::from_millis(10));
             let SupplementedSegmentRun {
@@ -995,7 +968,7 @@ mod tests {
                 segment_run,
             } = supplemented_segment_run_receiver.recv().unwrap();
             assert_eq!(nesting, 1);
-            assert_eq!(&name, "ABC");
+            assert_eq!(&name as &str, "ABC");
             assert_eq!(segment_run.deaths, 3);
             assert!(segment_run.duration() >= Duration::from_millis(75));
             let SupplementedSegmentRun {
@@ -1004,7 +977,7 @@ mod tests {
                 segment_run,
             } = supplemented_segment_run_receiver.recv().unwrap();
             assert_eq!(nesting, 0);
-            assert_eq!(&name, "ABABC");
+            assert_eq!(&name as &str, "ABABC");
             assert_eq!(segment_run.deaths, 6);
             assert!(segment_run.duration() >= Duration::from_millis(140));
         });
@@ -1078,7 +1051,7 @@ mod tests {
             Err(Error::IdNameNotFound { id_name }),
             id_name
         );
-        assert_eq!(id_name.as_str(), "z");
+        assert_eq!(&id_name as &str, "z");
     }
 
     /// Tests that the Config::use_run_info function returns a TooMuchNesting
@@ -1099,19 +1072,16 @@ mod tests {
     fn invalid_config_group_nonexistent_parts() {
         let (mut config, _temp_file) = make_abcd_config("j");
         let segment_group = SegmentGroupInfo {
-            display_name: String::from("new"),
+            display_name: Arc::from("new"),
             file_name: PathBuf::from("/new.csv"),
-            part_id_names: vec![
-                String::from("nonexistent"),
-                String::from("a"),
-                String::from("parts"),
-            ],
+            part_id_names: Arc::from([
+                Arc::from("nonexistent"),
+                Arc::from("a"),
+                Arc::from("parts"),
+            ]),
         };
         let (id_name, display_name, invalid_parts) = coerce_pattern!(
-            config.add_part(
-                String::from("new"),
-                ConfigPart::Group(segment_group)
-            ),
+            config.add_part(Arc::from("new"), ConfigPart::Group(segment_group)),
             Err(Error::PartsDontExist {
                 id_name,
                 display_name,
@@ -1119,11 +1089,11 @@ mod tests {
             }),
             (id_name, display_name, invalid_parts)
         );
-        assert_eq!(id_name.as_str(), "new");
-        assert_eq!(display_name.as_str(), "new");
+        assert_eq!(&id_name as &str, "new");
+        assert_eq!(&display_name as &str, "new");
         let mut invalid_parts = invalid_parts.into_iter();
-        assert_eq!(invalid_parts.next().unwrap().as_str(), "nonexistent");
-        assert_eq!(invalid_parts.next().unwrap().as_str(), "parts");
+        assert_eq!(&invalid_parts.next().unwrap() as &str, "nonexistent");
+        assert_eq!(&invalid_parts.next().unwrap() as &str, "parts");
         assert!(invalid_parts.next().is_none());
     }
 
@@ -1133,12 +1103,12 @@ mod tests {
         let (mut config, _temp_file) = make_abcd_config("k");
         for id_name_str in ["has:colon", "has\ttab"] {
             let segment = SegmentInfo {
-                display_name: String::from("new"),
+                display_name: Arc::from("new"),
                 file_name: PathBuf::from("/new.csv"),
             };
             let id_name = coerce_pattern!(
                 config.add_part(
-                    String::from(id_name_str),
+                    Arc::from(id_name_str),
                     ConfigPart::Segment(segment)
                 ),
                 Err(Error::IdNameInvalid {
@@ -1147,7 +1117,7 @@ mod tests {
                 }),
                 id_name
             );
-            assert_eq!(id_name.as_str(), id_name_str);
+            assert_eq!(&id_name as &str, id_name_str);
         }
     }
 
@@ -1157,13 +1127,13 @@ mod tests {
         let invalid_display_name = "has\ttab";
         let display_name = coerce_pattern!(
             SegmentInfo::new(
-                String::from(invalid_display_name),
+                Arc::from(invalid_display_name),
                 PathBuf::from("/new.csv")
             ),
             Err(Error::DisplayNameInvalid { display_name }),
             display_name
         );
-        assert_eq!(display_name.as_str(), invalid_display_name);
+        assert_eq!(&display_name as &str, invalid_display_name);
     }
 
     /// Tests making an invalid config by trying to add a group with parts that don't exist.
@@ -1171,15 +1141,15 @@ mod tests {
     fn invalid_config_non_unique_id_name() {
         let (mut config, _temp_file) = make_abcd_config("m");
         let segment = SegmentInfo {
-            display_name: String::from("new"),
+            display_name: Arc::from("new"),
             file_name: PathBuf::from("/new.csv"),
         };
         let id_name = coerce_pattern!(
-            config.add_part(String::from("a"), ConfigPart::Segment(segment)),
+            config.add_part(Arc::from("a"), ConfigPart::Segment(segment)),
             Err(Error::IdNameNotUnique { id_name }),
             id_name
         );
-        assert_eq!(id_name.as_str(), "a");
+        assert_eq!(&id_name as &str, "a");
     }
 
     /// Tests calling Config::load on a directory that doesn't have a config saved

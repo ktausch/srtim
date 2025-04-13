@@ -2,6 +2,7 @@
 use std::fmt::{self, Debug, Display};
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Large enum used to store every possible non-panicking error in the library
 pub enum Error {
@@ -68,12 +69,12 @@ pub enum Error {
     /// Segment or segment group doesn't have an absolute file
     FileNamePathsNotAbsolute {
         /// display name of the segment or segment group
-        display_name: String,
+        display_name: Arc<str>,
     },
     /// A segment group was given that had no parts
     EmptySegmentGroupInfo {
         /// display name of the empty segment group
-        display_name: String,
+        display_name: Arc<str>,
     },
     /// the tagging thread that turns individual segment runs into
     /// supplemented runs (including groups) couldn't proceed because
@@ -96,28 +97,28 @@ pub enum Error {
     /// an ID name was invalid because it contained disallowed character/substring(s)
     IdNameInvalid {
         /// the ID name that caused the issue
-        id_name: String,
+        id_name: Arc<str>,
         /// the component separator that must be avoided in ID names
         component_separator: &'static str,
     },
     /// a display name was invalid because it contained disallowed character/substring(s)
     DisplayNameInvalid {
         /// the display name of the segment or segment group that is
-        display_name: String,
+        display_name: Arc<str>,
     },
     /// the given ID name was not unique
     IdNameNotUnique {
         /// the ID name that already exists but was attempted to be added
-        id_name: String,
+        id_name: Arc<str>,
     },
     /// segment group is invalid because some parts of it don't exist yet
     PartsDontExist {
         /// ID name of the segment group
-        id_name: String,
+        id_name: Arc<str>,
         /// display name of the segment group
-        display_name: String,
+        display_name: Arc<str>,
         /// the names of the parts that don't exist
-        invalid_parts: Vec<String>,
+        invalid_parts: Arc<[Arc<str>]>,
     },
     /// a line of the config file has the wrong number of tokens
     InvalidConfigLine {
@@ -134,7 +135,7 @@ pub enum Error {
     /// group was expected, but none existed
     IdNameNotFound {
         /// the ID name that doesn't correspond to an actual segment or group
-        id_name: String,
+        id_name: Arc<str>,
     },
     /// the given run couldn't be worked with because it is too nested
     TooMuchNesting {
@@ -166,34 +167,34 @@ pub enum Error {
     /// the same CLI option was provided twice
     OptionProvidedTwice {
         /// the option that was provided twice
-        option: String,
+        option: Arc<str>,
     },
     /// the given option had values associated with it, even
     /// though it is expected to be a flag with no values
     OptionExpectedNoValues {
         /// the option that is meant to be a flag
-        option: String,
+        option: Arc<str>,
         /// all string values associated with the option
-        values: Vec<String>,
+        values: Arc<[Arc<str>]>,
     },
     /// the given option didn't have exactly one value associated with it
     OptionExpectedOneValue {
         /// the option that is meant to have one value associated with it
-        option: String,
+        option: Arc<str>,
         /// the 0 or multuple values associated with the option
-        values: Vec<String>,
+        values: Arc<[Arc<str>]>,
     },
     /// the given option that was expected was not found
     OptionNotFound {
         /// the option that was expected
-        option: String,
+        option: Arc<str>,
     },
     /// No CLI mode was found in the positional arguments
     NoModeFound,
     /// More than the mode was passed as a positional argument
-    TooManyPositionalArguments { extra_argument: String },
+    TooManyPositionalArguments { extra_argument: Arc<str> },
     /// Mode was not one of the expected values
-    UnknownMode { mode: String },
+    UnknownMode { mode: Arc<str> },
 }
 
 /// Type for Result whose Error is from this library
@@ -505,7 +506,7 @@ mod tests {
             format!(
                 "{}",
                 Error::FileNamePathsNotAbsolute {
-                    display_name: String::from("display")
+                    display_name: Arc::from("display")
                 }
             )
             .as_str(),
@@ -515,7 +516,7 @@ mod tests {
             format!(
                 "{}",
                 Error::EmptySegmentGroupInfo {
-                    display_name: String::from("display")
+                    display_name: Arc::from("display")
                 }
             )
             .as_str(),
@@ -548,7 +549,7 @@ mod tests {
             format!(
                 "{}",
                 Error::DisplayNameInvalid {
-                    display_name: String::from("dis\tplay")
+                    display_name: Arc::from("dis\tplay")
                 }
             )
             .as_str(),
@@ -558,7 +559,7 @@ mod tests {
             format!(
                 "{}",
                 Error::IdNameInvalid {
-                    id_name: String::from("i:d"),
+                    id_name: Arc::from("i:d"),
                     component_separator: ":",
                 }
             )
@@ -569,7 +570,7 @@ mod tests {
             format!(
                 "{}",
                 Error::IdNameNotUnique {
-                    id_name: String::from("a")
+                    id_name: Arc::from("a")
                 }
             )
             .as_str(),
@@ -579,9 +580,9 @@ mod tests {
             format!(
                 "{}",
                 Error::PartsDontExist {
-                    id_name: String::from("a"),
-                    display_name: String::from("A"),
-                    invalid_parts: vec![String::from("b"), String::from("c")]
+                    id_name: Arc::from("a"),
+                    display_name: Arc::from("A"),
+                    invalid_parts: Arc::from([Arc::from("b"), Arc::from("c")])
                 }
             )
             .as_str(),
@@ -625,7 +626,7 @@ mod tests {
             format!(
                 "{}",
                 Error::IdNameNotFound {
-                    id_name: String::from("a")
+                    id_name: Arc::from("a")
                 }
             )
             .as_str(),
@@ -697,7 +698,7 @@ mod tests {
             format!(
                 "{}",
                 Error::OptionProvidedTwice {
-                    option: String::from("--option")
+                    option: Arc::from("--option")
                 }
             )
             .as_str(),
@@ -707,8 +708,8 @@ mod tests {
             format!(
                 "{}",
                 Error::OptionExpectedNoValues {
-                    option: String::from("--option"),
-                    values: vec![String::from("value")]
+                    option: Arc::from("--option"),
+                    values: Arc::from([Arc::from("value")])
                 }
             )
             .as_str(),
@@ -718,8 +719,8 @@ mod tests {
             format!(
                 "{}",
                 Error::OptionExpectedOneValue {
-                    option: String::from("--option"),
-                    values: vec![]
+                    option: Arc::from("--option"),
+                    values: Arc::from([])
                 }
             )
             .as_str(),
@@ -729,7 +730,7 @@ mod tests {
             format!(
                 "{}",
                 Error::OptionNotFound {
-                    option: String::from("--option")
+                    option: Arc::from("--option")
                 }
             )
             .as_str(),
@@ -743,7 +744,7 @@ mod tests {
             format!(
                 "{}",
                 Error::TooManyPositionalArguments {
-                    extra_argument: String::from("something uniquelkafd")
+                    extra_argument: Arc::from("something uniquelkafd")
                 }
             )
             .as_str(),
@@ -753,7 +754,7 @@ mod tests {
             format!(
                 "{}",
                 Error::UnknownMode {
-                    mode: String::from("weird unknown mode")
+                    mode: Arc::from("weird unknown mode")
                 }
             )
             .as_str(),
