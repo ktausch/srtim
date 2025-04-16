@@ -16,7 +16,7 @@ use crate::utils::load_n_tokens;
 const COMPONENT_SEPARATOR: &'static str = ":";
 
 /// Represents a single entry of the config file
-enum ConfigPart {
+pub enum ConfigPart {
     /// an entry of the config file corresponding to an indivisible segment
     Segment(SegmentInfo),
     /// an entry of the config file corresponding to a group of segments
@@ -25,6 +25,7 @@ enum ConfigPart {
 
 impl ConfigPart {
     /// Gets the display name of the part
+    #[allow(dead_code)]
     fn display_name(&self) -> &Arc<str> {
         match self {
             ConfigPart::Segment(segment_info) => &segment_info.display_name,
@@ -53,9 +54,66 @@ impl Config {
         }
     }
 
+    /// Read-only view of the actual segments and groups in the config
+    pub fn parts(&self) -> &HashMap<Arc<str>, ConfigPart> {
+        &self.parts
+    }
+
     /// finds the config file inside the given root directory
     pub fn file_name(root: &Path) -> PathBuf {
         root.join(PathBuf::from(Self::FILE_NAME))
+    }
+
+    /// Transforms a part to lean it as much as possible in terms
+    /// of the number of allocations it implies. If the part is a
+    /// single segment, it is returned as is. If the part is a
+    /// segment group, its part name `Arc<str>` objects are replaced
+    /// by clones of the IDs they correspond to so that the actual
+    /// string allocations only happen once.
+    fn thin_out_part(
+        &self,
+        id_name: Arc<str>,
+        part: ConfigPart,
+    ) -> Result<(Arc<str>, ConfigPart)> {
+        match part {
+            ConfigPart::Segment(_) => Ok((id_name, part)),
+            ConfigPart::Group(SegmentGroupInfo {
+                display_name,
+                part_id_names,
+                file_name,
+            }) => {
+                if part_id_names.iter().any(|s| !self.parts.contains_key(s)) {
+                    return Err(Error::PartsDontExist {
+                        id_name,
+                        display_name,
+                        invalid_parts: part_id_names
+                            .iter()
+                            .filter(|s| !self.parts.contains_key(*s))
+                            .map(|s| s.clone())
+                            .collect(),
+                    });
+                }
+                let new_part_id_names: Arc<[Arc<str>]> = (&part_id_names
+                    as &[Arc<str>])
+                    .into_iter()
+                    .map(|part_id_name| {
+                        self.parts
+                            .get_key_value(part_id_name)
+                            .unwrap()
+                            .0
+                            .clone()
+                    })
+                    .collect();
+                Ok((
+                    id_name,
+                    ConfigPart::Group(SegmentGroupInfo {
+                        display_name,
+                        part_id_names: new_part_id_names,
+                        file_name,
+                    }),
+                ))
+            }
+        }
     }
 
     /// Adds a part (either a segment or a group of segments) with the given ID name.
@@ -70,20 +128,7 @@ impl Config {
                 component_separator: COMPONENT_SEPARATOR,
             });
         }
-        if let ConfigPart::Group(SegmentGroupInfo { part_id_names, .. }) = &part
-        {
-            if part_id_names.iter().any(|s| !self.parts.contains_key(s)) {
-                return Err(Error::PartsDontExist {
-                    id_name,
-                    display_name: part.display_name().clone(),
-                    invalid_parts: part_id_names
-                        .iter()
-                        .filter(|s| !self.parts.contains_key(*s))
-                        .map(|s| s.clone())
-                        .collect(),
-                });
-            }
-        }
+        let (id_name, part) = self.thin_out_part(id_name, part)?;
         match self.parts.entry(id_name) {
             Entry::Occupied(e) => Err(Error::IdNameNotUnique {
                 id_name: e.key().clone(),
@@ -117,6 +162,111 @@ impl Config {
         let segment_group =
             SegmentGroupInfo::new(display_name, part_id_names, file_name)?;
         self.add_part(id_name, ConfigPart::Group(segment_group))
+    }
+
+    /// For each node, find ID names of all segment groups that contain
+    /// it directly. Transitive descent is not considered here.
+    fn first_order_dependencies(&self) -> HashMap<Arc<str>, Arc<[Arc<str>]>> {
+        let mut pre_processed: HashMap<Arc<str>, Vec<Arc<str>>> =
+            HashMap::new();
+        for (id_name, part) in &self.parts {
+            if let ConfigPart::Group(segment_group_info) = part {
+                for part_id_name in
+                    &segment_group_info.part_id_names as &[Arc<str>]
+                {
+                    match pre_processed.entry(part_id_name.clone()) {
+                        Entry::Occupied(mut entry) => {
+                            entry.get_mut().push(id_name.clone());
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(vec![id_name.clone()]);
+                        }
+                    }
+                }
+            }
+        }
+        let mut result = HashMap::new();
+        for (id_name, dependencies) in pre_processed {
+            result.insert(id_name, dependencies.into());
+        }
+        result
+    }
+
+    /// Gets the ID names of all nodes that have the given node as a descendant.
+    /// Fails if the ID name is not found in the config at all.
+    fn node_dependencies(&self, id_name: &str) -> Result<Arc<[Arc<str>]>> {
+        let first_order_dependencies = self.first_order_dependencies();
+        let mut result = HashSet::new();
+        let mut processed = HashSet::new();
+        let mut to_process: Vec<Arc<str>> = Vec::new();
+        to_process.push(Arc::from(id_name));
+        while !to_process.is_empty() {
+            to_process = {
+                let mut new_to_process: Vec<Arc<str>> = Vec::new();
+                for element in to_process {
+                    let element_clone = element.clone();
+                    if !processed.insert(element) {
+                        continue;
+                    }
+                    let dependencies =
+                        match first_order_dependencies.get(&element_clone) {
+                            None => continue,
+                            Some(dependencies) => dependencies as &[Arc<str>],
+                        };
+                    for dependency in dependencies {
+                        new_to_process.push(dependency.clone());
+                        result.insert(dependency.clone());
+                    }
+                }
+                new_to_process
+            }
+        }
+        match self.parts.contains_key(id_name) {
+            true => Ok(result.into_iter().collect()),
+            false => Err(Error::IdNameNotFound {
+                id_name: Arc::from(id_name),
+            }),
+        }
+    }
+
+    /// Deletes a segment or group of segments. Will fail if the part
+    /// is an element in the run tree of a different segment group or
+    /// if no segment or segment group has the given id name
+    pub fn delete_part(
+        &mut self,
+        id_name: &str,
+    ) -> Result<(Arc<str>, ConfigPart)> {
+        let dependencies = self.node_dependencies(id_name)?;
+        match dependencies.is_empty() {
+            true => {
+                // unwrap is safe here because if id_name wasn't in self.parts,
+                // then dependency calculation would return an error and would
+                // short circuit above this match expression
+                Ok(self.parts.remove_entry(id_name).unwrap())
+            }
+            false => Err(Error::CannotDeletePart {
+                part_id_name: Arc::from(id_name),
+                constraining_parts: dependencies,
+            }),
+        }
+    }
+
+    /// Deletes the part with the given ID name.
+    /// Also deletes all parts that depend on it.
+    pub fn delete_part_recursive(
+        &mut self,
+        id_name: &str,
+    ) -> Result<HashMap<Arc<str>, ConfigPart>> {
+        let mut result = HashMap::new();
+        let transitive_dependencies = self.node_dependencies(id_name)?;
+        for transitive_dependency in &transitive_dependencies as &[Arc<str>] {
+            let (transitive_dependency, deleted_part) =
+                self.parts.remove_entry(transitive_dependency).unwrap();
+            result.insert(transitive_dependency, deleted_part);
+        }
+        let (id_name, final_part) = self.parts.remove_entry(id_name).unwrap();
+        result.insert(id_name, final_part);
+        Ok(result)
     }
 
     /// Loads a single line of the from the config file. index is the index of the line
@@ -524,7 +674,20 @@ mod tests {
     use crate::segment_run::SegmentRun;
     use crate::utils::TempFile;
 
-    /// Makes a config containing 5 segments, A-E, and three groups, (AB), ((AB)C), and (((AB)C)D)
+    /// Makes a config containing
+    /// - A
+    /// - B
+    /// - C
+    /// - D
+    /// - E
+    /// - F
+    /// - G
+    /// - (AB)
+    /// - ((AB)C)
+    /// - (((AB)C)D)
+    /// - ((((AB)C)D)F)
+    /// - (((((AB)C)D)F)G)
+    /// - ((AB)((AB)C))
     fn make_abcd_config(extra: &str) -> (Config, TempFile) {
         let mut config = Config::new(temp_dir().join(extra));
         assert!(config.add_segment(Arc::from("b"), Arc::from("B")).is_ok());
@@ -1176,5 +1339,324 @@ mod tests {
             io_error
         );
         assert_eq!(io_error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Tests that the Config::first_order_dependencies method correctly finds
+    /// all direct containment relationships (i.e. the direct parts of all
+    /// segment groups in the config)
+    #[test]
+    fn test_first_order_dependencies() {
+        let (config, _temp_file) =
+            make_abcd_config("test_first_order_dependencies");
+        let all_dependencies = config.first_order_dependencies();
+        let get_dependencies = |id_name: &str| -> HashSet<&str> {
+            let dependencies =
+                all_dependencies.get(id_name).unwrap() as &[Arc<str>];
+            let length = dependencies.len();
+            let as_set: HashSet<&str> =
+                dependencies.into_iter().map(|name| name as &str).collect();
+            assert_eq!(as_set.len(), length);
+            as_set
+        };
+        let dependencies = get_dependencies("a");
+        assert_eq!(dependencies.len(), 1);
+        assert!(dependencies.contains("ab"));
+        let dependencies = get_dependencies("b");
+        assert_eq!(dependencies.len(), 1);
+        assert!(dependencies.contains("ab"));
+        let dependencies = get_dependencies("c");
+        assert_eq!(dependencies.len(), 1);
+        assert!(dependencies.contains("abc"));
+        let dependencies = get_dependencies("d");
+        assert_eq!(dependencies.len(), 1);
+        assert!(dependencies.contains("abcd"));
+        assert!(all_dependencies.get("e").is_none());
+        let dependencies = get_dependencies("f");
+        assert_eq!(dependencies.len(), 1);
+        assert!(dependencies.contains("abcdf"));
+        let dependencies = get_dependencies("g");
+        assert_eq!(dependencies.len(), 1);
+        assert!(dependencies.contains("abcdfg"));
+        let dependencies = get_dependencies("ab");
+        assert_eq!(dependencies.len(), 2);
+        assert!(dependencies.contains("abc"));
+        assert!(dependencies.contains("ababc"));
+        let dependencies = get_dependencies("abc");
+        assert_eq!(dependencies.len(), 2);
+        assert!(dependencies.contains("abcd"));
+        assert!(dependencies.contains("ababc"));
+        let dependencies = get_dependencies("abcd");
+        assert_eq!(dependencies.len(), 1);
+        assert!(dependencies.contains("abcdf"));
+        let dependencies = get_dependencies("abcdf");
+        assert_eq!(dependencies.len(), 1);
+        assert!(dependencies.contains("abcdfg"));
+        assert!(all_dependencies.get("abcdfg").is_none());
+        assert!(all_dependencies.get("ababc").is_none());
+    }
+
+    /// Tests that the Config::node_dependencies method returns an IdNameNotFound
+    /// error if an ID name that doesn't exist is passed to it.
+    #[test]
+    fn test_node_dependencies_non_existent_name() {
+        let (config, _temp_file) =
+            make_abcd_config("test_node_dependencies_non_existent_name");
+        assert_eq!(
+            &coerce_pattern!(
+                config.node_dependencies("doesntexist"),
+                Err(Error::IdNameNotFound { id_name }),
+                id_name
+            ) as &str,
+            "doesntexist"
+        );
+    }
+
+    /// Tests that the Config::node_dependencies method returns an empty
+    /// Arc<[Arc<str>]> if an ID name that can be deleted without conflict
+    /// is past.
+    #[test]
+    fn test_node_dependencies_no_parents() {
+        let (config, _temp_file) =
+            make_abcd_config("test_node_dependencies_no_parents");
+        assert!(config.node_dependencies("ababc").unwrap().is_empty());
+    }
+
+    /// Tests that the Config::node_dependencies method returns a list
+    /// of all groups that a segment is a part of when those groups
+    /// are not themselves part of groups.
+    #[test]
+    fn test_node_dependencies_direct_parent() {
+        let (config, _temp_file) =
+            make_abcd_config("test_node_dependencies_direct_parent");
+        let dependencies = config.node_dependencies("abcdf").unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(&dependencies[0] as &str, "abcdfg");
+    }
+
+    /// Tests that, in the general case of passing in any ID name to
+    /// Config::node_dependencies, it returns a list of all segment groups
+    /// that contain the part, even in a nested way (e.g. being part of a group
+    /// that is part of another group)
+    #[test]
+    fn test_node_dependencies_transitive_parents() {
+        let (config, _temp_file) =
+            make_abcd_config("test_node_dependencies_transitive_parents");
+        let all_dependencies = config.node_dependencies("ab").unwrap();
+        let dependencies: HashSet<&str> = (&all_dependencies as &[Arc<str>])
+            .into_iter()
+            .map(|name| name as &str)
+            .collect();
+        assert_eq!(dependencies.len(), 5);
+        assert!(dependencies.contains("abc"));
+        assert!(dependencies.contains("ababc"));
+        assert!(dependencies.contains("abcdf"));
+        assert!(dependencies.contains("abcdfg"));
+    }
+
+    /// Tests that an IdNameNotFound error is returned if Config::delete_part
+    /// is called with an ID name that doesn't correspond to any saved parts.
+    #[test]
+    fn test_delete_part_non_existent_name() {
+        let (mut config, _temp_file) =
+            make_abcd_config("test_delete_part_non_existent_name");
+        assert_eq!(
+            &coerce_pattern!(
+                config.delete_part("doesntexist"),
+                Err(Error::IdNameNotFound { id_name }),
+                id_name
+            ) as &str,
+            "doesntexist"
+        );
+    }
+
+    /// Tests that the Config::delete_part method successfully deletes
+    /// single segments that are not part of any groups.
+    #[test]
+    fn test_delete_part_dependencyless_segment() {
+        let (mut config, _temp_file) =
+            make_abcd_config("test_delete_part_dependencyless_segment");
+        let (id_name, deleted) = coerce_pattern!(
+            config.delete_part("e"),
+            Ok((id_name, ConfigPart::Segment(segment_info))),
+            (id_name, segment_info)
+        );
+        assert_eq!(&id_name as &str, "e");
+        assert_eq!(&deleted.display_name as &str, "E");
+    }
+
+    /// Tests that the Config::delete_part method successfully deletes
+    /// segment groups that are not part of any other groups.
+    #[test]
+    fn test_delete_part_dependencyless_segment_group() {
+        let (mut config, _temp_file) =
+            make_abcd_config("test_delete_part_dependencyless_segment_group");
+        let (id_name, deleted) = coerce_pattern!(
+            config.delete_part("ababc"),
+            Ok((id_name, ConfigPart::Group(segment_group_info))),
+            (id_name, segment_group_info)
+        );
+        assert_eq!(&id_name as &str, "ababc");
+        assert_eq!(&deleted.display_name as &str, "ABABC");
+        let part_id_names: Vec<&str> = deleted
+            .part_id_names
+            .into_iter()
+            .map(|part_id_name| part_id_name as &str)
+            .collect();
+        assert_eq!(part_id_names.len(), 2);
+        assert_eq!(part_id_names[0], "ab");
+        assert_eq!(part_id_names[1], "abc");
+    }
+
+    /// Tests that the Config::delete_part method returns an error
+    /// with all groups a part is a part of if it can't be deleted.
+    #[test]
+    fn test_delete_part_only_direct_parent() {
+        let (mut config, _temp_file) =
+            make_abcd_config("test_delete_part_only_direct_parent");
+        let (part_id_name, constraining_parts) = coerce_pattern!(
+            config.delete_part("abcdf"),
+            Err(Error::CannotDeletePart {
+                part_id_name,
+                constraining_parts
+            }),
+            (part_id_name, constraining_parts)
+        );
+        assert_eq!(&part_id_name as &str, "abcdf");
+        assert_eq!(constraining_parts.len(), 1);
+        assert_eq!(&constraining_parts[0] as &str, "abcdfg");
+    }
+
+    /// Tests that the Config::delete_part method returns an error
+    /// with all groups a part is a part of if it can't be deleted.
+    /// Same as test_delete_part_only_direct_parent except this one
+    /// also tests that transitive membership of groups is reflected
+    /// in returned error.
+    #[test]
+    fn test_delete_part_transitive_parents() {
+        let (mut config, _temp_file) =
+            make_abcd_config("test_delete_part_transitive_parents");
+        let (part_id_name, constraining_parts) = coerce_pattern!(
+            config.delete_part("abc"),
+            Err(Error::CannotDeletePart {
+                part_id_name,
+                constraining_parts
+            }),
+            (part_id_name, constraining_parts)
+        );
+        assert_eq!(&part_id_name as &str, "abc");
+        assert_eq!(constraining_parts.len(), 4);
+        let constraining_parts: HashSet<&str> = (&constraining_parts
+            as &[Arc<str>])
+            .into_iter()
+            .map(|constraining_part| constraining_part as &str)
+            .collect();
+        assert_eq!(constraining_parts.len(), 4);
+        assert!(constraining_parts.contains("ababc"));
+        assert!(constraining_parts.contains("abcd"));
+        assert!(constraining_parts.contains("abcdf"));
+        assert!(constraining_parts.contains("abcdfg"));
+    }
+
+    /// Tests that the Config::delete_part_recursive method returns
+    /// an IdNameNotFound error if passed a nonexistent ID name
+    #[test]
+    fn test_delete_part_recursive_nonexistent_name() {
+        let (mut config, _temp_file) =
+            make_abcd_config("test_delete_part_recursive_nonexistent_name");
+        assert_eq!(
+            &coerce_pattern!(
+                config.delete_part_recursive("doesnt_exist"),
+                Err(Error::IdNameNotFound { id_name }),
+                id_name
+            ) as &str,
+            "doesnt_exist"
+        );
+    }
+
+    /// Tests the Config::delete_part_recursive to ensure that it properly deletes
+    /// all parts that depend on the given part by using ((AB)C) in the abcd config
+    #[test]
+    fn test_delete_part_recursive_abc() {
+        let (mut config, _temp_file) =
+            make_abcd_config("test_delete_part_recursive_complex");
+        assert_eq!(config.parts.len(), 13);
+        let deleted = config.delete_part_recursive("abc").unwrap();
+        assert_eq!(deleted.len(), 5);
+        assert_eq!(&deleted.get("abc").unwrap().display_name() as &str, "ABC");
+        assert_eq!(
+            &deleted.get("abcd").unwrap().display_name() as &str,
+            "ABCD"
+        );
+        assert_eq!(
+            &deleted.get("abcdf").unwrap().display_name() as &str,
+            "ABCDF"
+        );
+        assert_eq!(
+            &deleted.get("abcdfg").unwrap().display_name() as &str,
+            "ABCDFG"
+        );
+        assert_eq!(
+            &deleted.get("ababc").unwrap().display_name() as &str,
+            "ABABC"
+        );
+        assert_eq!(config.parts.len(), 8);
+        assert!(config.parts.contains_key("a"));
+        assert!(config.parts.contains_key("b"));
+        assert!(config.parts.contains_key("ab"));
+        assert!(config.parts.contains_key("c"));
+        assert!(config.parts.contains_key("d"));
+        assert!(config.parts.contains_key("e"));
+        assert!(config.parts.contains_key("f"));
+        assert!(config.parts.contains_key("g"));
+    }
+
+    /// Ensures that the Config::delete_part_recursive
+    #[test]
+    fn test_delete_part_recursive_aabcaa() {
+        let mut config = Config::new(PathBuf::from("/my_root"));
+        config.add_segment(Arc::from("a"), Arc::from("A")).unwrap();
+        config.add_segment(Arc::from("b"), Arc::from("B")).unwrap();
+        config.add_segment(Arc::from("c"), Arc::from("C")).unwrap();
+        config
+            .add_segment_group(
+                Arc::from("bc"),
+                Arc::from("BC"),
+                Arc::from([Arc::from("b"), Arc::from("c")]),
+            )
+            .unwrap();
+        config
+            .add_segment_group(
+                Arc::from("aa"),
+                Arc::from("AA"),
+                Arc::from([Arc::from("a"), Arc::from("a")]),
+            )
+            .unwrap();
+        config
+            .add_segment_group(
+                Arc::from("abc"),
+                Arc::from("ABC"),
+                Arc::from([Arc::from("a"), Arc::from("bc")]),
+            )
+            .unwrap();
+        config
+            .add_segment_group(
+                Arc::from("aabcaa"),
+                Arc::from("AABCAA"),
+                Arc::from([Arc::from("a"), Arc::from("abc"), Arc::from("aa")]),
+            )
+            .unwrap();
+        let deleted = config.delete_part_recursive("a").unwrap();
+        assert_eq!(deleted.len(), 4);
+        assert_eq!(&deleted.get("a").unwrap().display_name() as &str, "A");
+        assert_eq!(&deleted.get("aa").unwrap().display_name() as &str, "AA");
+        assert_eq!(&deleted.get("abc").unwrap().display_name() as &str, "ABC");
+        assert_eq!(
+            &deleted.get("aabcaa").unwrap().display_name() as &str,
+            "AABCAA"
+        );
+        assert_eq!(config.parts.len(), 3);
+        assert!(config.parts.contains_key("b"));
+        assert!(config.parts.contains_key("c"));
+        assert!(config.parts.contains_key("bc"));
     }
 }

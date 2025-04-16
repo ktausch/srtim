@@ -195,6 +195,12 @@ pub enum Error {
     TooManyPositionalArguments { extra_argument: Arc<str> },
     /// Mode was not one of the expected values
     UnknownMode { mode: Arc<str> },
+    /// Cannot delete a part because it is a (possibly
+    /// transitive) member of the contained groups
+    CannotDeletePart {
+        part_id_name: Arc<str>,
+        constraining_parts: Arc<[Arc<str>]>,
+    },
 }
 
 /// Type for Result whose Error is from this library
@@ -390,6 +396,17 @@ impl Debug for Error {
             }
             Error::UnknownMode { mode } => {
                 write!(f, "The mode \"{mode}\" is not valid")
+            }
+            Error::CannotDeletePart {
+                part_id_name,
+                constraining_parts,
+            } => {
+                write!(
+                    f,
+                    "Can't delete part with ID name \"{part_id_name}\" because the following {} group(s) reference it: [\"{}\"]",
+                    constraining_parts.len(),
+                    constraining_parts.join("\", \"")
+                )
             }
         }
     }
@@ -760,5 +777,19 @@ mod tests {
             .as_str(),
             "The mode \"weird unknown mode\" is not valid"
         );
+        assert_eq!(
+            format!(
+                "{}",
+                Error::CannotDeletePart {
+                    part_id_name: Arc::from("to_delete"),
+                    constraining_parts: Arc::from([
+                        Arc::from("contains_to_delete"),
+                        Arc::from("contains_contains_to_delete")
+                    ])
+                }
+            )
+            .as_str(),
+            "Can't delete part with ID name \"to_delete\" because the following 2 group(s) reference it: [\"contains_to_delete\", \"contains_contains_to_delete\"]"
+        )
     }
 }

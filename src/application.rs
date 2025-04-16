@@ -47,6 +47,17 @@ this segment or group. It can be any unicode string without tabs.
 
 `srtim add --id-name <ID_NAME> --display-name <DISPLAY_NAME> [--parts <PART_ID_1> <PART_ID_2> ...]`
 
+------
+delete
+------
+
+Deletes a segment or segment group from the configuration file. If the given part is
+a component of a segment group in the config, then this command will error out unless
+the --recursive flag is passed, and even then, the user will be asked to confirm that
+they actually want to delete all of the dependencies.
+
+`srtim delete --id-name <ID_NAME> [--recursive]`
+
 ---
 run
 ---
@@ -125,6 +136,62 @@ impl CustomOutput for StdCustomOutput {
     fn eprintln(&self, message: String) {
         eprintln!("{message}");
     }
+}
+
+/// Deletes one or more segments or groups from the config. Multiple parts
+/// can be deleted only if --recursive is supplied in the input.
+fn delete_part_from_input<I, O>(
+    mut input: Input,
+    mut config: Config,
+    custom_input: I,
+    custom_output: &O,
+) -> Result<()>
+where
+    I: CustomInput,
+    O: CustomOutput,
+{
+    let id_name = input.extract_option_single_value("--id-name")?;
+    let should_save = match input.extract_option_no_values("--recursive")? {
+        true => {
+            let deleted = config.delete_part_recursive(&id_name)?;
+            if deleted.len() > 1 {
+                let mut deleted_keys: Vec<&str> = deleted
+                    .keys()
+                    .map(|deleted_id_name| deleted_id_name as &str)
+                    .collect();
+                deleted_keys.sort();
+                custom_output.println(
+                    format!(
+                        "Recursive deletion of part with ID name \"{id_name}\" would result in deletion of {} parts: [\"{}\"]. Enter \"yes\" to confirm:",
+                        deleted.len(),
+                        deleted_keys.join("\", \"")
+                    )
+                );
+                let line = custom_input
+                    .get_line()
+                    .map_err(|error| Error::CouldNotReadFromStdin { error })?;
+                let should_save = line.trim().to_lowercase().as_str() == "yes";
+                custom_output.println(match should_save {
+                    true => format!(
+                        "Ok! Deleting all {} of these parts.",
+                        deleted.len()
+                    ),
+                    false => String::from("Ok! Deleting nothing."),
+                });
+                should_save
+            } else {
+                true
+            }
+        }
+        false => {
+            config.delete_part(&id_name)?;
+            true
+        }
+    };
+    if should_save {
+        config.save()?;
+    }
+    Ok(())
 }
 
 /// Runs the segment using string input
@@ -256,6 +323,9 @@ where
         "add" => add_part_from_input(input, config),
         "run" => {
             run_part_from_input(input, config, custom_input, custom_output)
+        }
+        "delete" => {
+            delete_part_from_input(input, config, custom_input, custom_output)
         }
         "help" => Ok(custom_output.println(String::from(HELP_MESSAGE))),
         other => {
@@ -406,6 +476,15 @@ mod tests {
         }
     }
 
+    impl TestCustomInput<core::array::IntoIter<(String, u64), 0>> {
+        /// Creates a new TestCustomInput object that does yield any lines.
+        fn empty() -> Self {
+            Self {
+                iterator: Mutex::new(([] as [(String, u64); 0]).into_iter()),
+            }
+        }
+    }
+
     impl<T: Iterator<Item = (String, u64)>> CustomInput for TestCustomInput<T> {
         /// Reaches into inner iterator and pulls out a string and number.
         /// Waits the given number of milliseconds and then returns string.
@@ -418,6 +497,16 @@ mod tests {
                     Ok(string)
                 }
                 None => Err(io::ErrorKind::Unsupported.into()),
+            }
+        }
+    }
+
+    impl<T: Iterator<Item = (String, u64)>> Drop for TestCustomInput<T> {
+        /// When drop is called on a TestCustomInput, it is ensured,
+        /// at risk of panic, that all messages have been depleted.
+        fn drop(&mut self) {
+            if let Some(_) = self.iterator.lock().unwrap().deref_mut().next() {
+                panic!("TestCustomInput's messages were not fully depleted.");
             }
         }
     }
@@ -805,5 +894,322 @@ mod tests {
             mode
         );
         assert_eq!(&mode as &str, "thisisdefinitelynotamode");
+    }
+
+    /// Tests the delete subcommand when --id-name is given but with no value.
+    #[test]
+    fn test_delete_part_from_input_no_id_name() {
+        let root = temp_dir().join("test_delete_part_from_input_no_id_name");
+        let config = Config::new(root.clone());
+        let input = Input::collect(
+            ["<>", "delete", "--id-name"].into_iter().map(String::from),
+        )
+        .unwrap();
+        let custom_input = TestCustomInput::empty();
+        let custom_output = TestCustomOutput::new();
+        let (option, values) = coerce_pattern!(
+            run_application_base(input, config, custom_input, &custom_output),
+            Err(Error::OptionExpectedOneValue { option, values }),
+            (option, values)
+        );
+        assert_eq!(&option as &str, "--id-name");
+        assert!(values.is_empty());
+        assert!(custom_output.consume().is_empty());
+    }
+
+    /// Tests the delete subcommand where --recursive is
+    /// given, but with a value instead of as a flag.
+    #[test]
+    fn test_delete_part_from_input_recursive_with_value() {
+        let root =
+            temp_dir().join("test_delete_part_from_input_recursive_with_value");
+        let config = Config::new(root.clone());
+        let input = Input::collect(
+            [
+                "<>",
+                "delete",
+                "--id-name",
+                "a",
+                "--recursive",
+                "thisshouldntbehere",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        let custom_input = TestCustomInput::empty();
+        let custom_output = TestCustomOutput::new();
+        let (option, values) = coerce_pattern!(
+            run_application_base(input, config, custom_input, &custom_output),
+            Err(Error::OptionExpectedNoValues { option, values }),
+            (option, values)
+        );
+        assert_eq!(&option as &str, "--recursive");
+        assert_eq!(values.len(), 1);
+        assert_eq!(&values[0] as &str, "thisshouldntbehere");
+    }
+
+    /// Tests the delete subcommand without the --recursive flag, including:
+    /// - Error generated when --recursive would be needed
+    /// - Success when --recursive is not needed
+    /// - Error generated when id name being deleted isn't present
+    #[test]
+    fn test_delete_part_from_input_nonrecursive() {
+        let root = temp_dir().join("test_delete_part_from_input_nonrecursive");
+        let _temp_file_config = TempFile {
+            path: root.join("config.tsv"),
+        };
+        let mut config = Config::new(root.clone());
+        config.add_segment(Arc::from("a"), Arc::from("A")).unwrap();
+        config
+            .add_segment_group(
+                Arc::from("aa"),
+                Arc::from("AA"),
+                Arc::from([Arc::from("a"), Arc::from("a")]),
+            )
+            .unwrap();
+        let input = Input::collect(
+            ["<>", "delete", "--id-name", "a"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        config.save().unwrap();
+        assert_eq!(config.parts().len(), 2);
+        {
+            let custom_input = TestCustomInput::empty();
+            let custom_output = TestCustomOutput::new();
+            let (part_id_name, constraining_parts) = coerce_pattern!(
+                run_application_base(
+                    input,
+                    config,
+                    custom_input,
+                    &custom_output
+                ),
+                Err(Error::CannotDeletePart {
+                    part_id_name,
+                    constraining_parts
+                }),
+                (part_id_name, constraining_parts)
+            );
+            assert_eq!(&part_id_name as &str, "a");
+            assert_eq!(constraining_parts.len(), 1);
+            assert_eq!(&constraining_parts[0] as &str, "aa");
+            assert!(custom_output.consume().is_empty());
+        }
+        let config = Config::load(root.clone()).unwrap();
+        assert_eq!(config.parts().len(), 2);
+        {
+            let input = Input::collect(
+                ["<>", "delete", "--id-name", "aa"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap();
+            let custom_input = TestCustomInput::empty();
+            let custom_output = TestCustomOutput::new();
+            run_application_base(input, config, custom_input, &custom_output)
+                .unwrap();
+            assert!(custom_output.consume().is_empty());
+        }
+        let config = Config::load(root.clone()).unwrap();
+        assert_eq!(config.parts().len(), 1);
+        {
+            let input = Input::collect(
+                ["<>", "delete", "--id-name", "a"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap();
+            let custom_input = TestCustomInput::empty();
+            let custom_output = TestCustomOutput::new();
+            run_application_base(input, config, custom_input, &custom_output)
+                .unwrap();
+            assert!(custom_output.consume().is_empty());
+        }
+        let config = Config::load(root.clone()).unwrap();
+        assert!(config.parts().is_empty());
+        {
+            let input = Input::collect(
+                ["<>", "delete", "--id-name", "a"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap();
+            let custom_input = TestCustomInput::empty();
+            let custom_output = TestCustomOutput::new();
+            assert_eq!(
+                &coerce_pattern!(
+                    run_application_base(
+                        input,
+                        config,
+                        custom_input,
+                        &custom_output
+                    ),
+                    Err(Error::IdNameNotFound { id_name }),
+                    id_name
+                ) as &str,
+                "a"
+            );
+        }
+    }
+
+    /// Tests the delete subcommand with the --recursive flag, including:
+    /// - Error generated when --recursive requires user
+    ///   confirmation but no input could be read
+    /// - Successful no-op performed when --recursive requires
+    ///   user confirmation, but user does not say yes
+    /// - Successful deletion performed when --recursive requires
+    ///   user confirmation and the user says yes
+    /// - Successful deletion performed when --recursive doesn't require
+    ///   confirmation (which is when deletion could be done without --recursive)
+    /// - Error generated when id name being deleted isn't present
+    #[test]
+    fn test_delete_part_from_input_recursive() {
+        let root = temp_dir().join("test_delete_part_from_input_recursive");
+        let _temp_file_config = TempFile {
+            path: root.join("config.tsv"),
+        };
+        let mut config = Config::new(root.clone());
+        config.add_segment(Arc::from("a"), Arc::from("A")).unwrap();
+        config.add_segment(Arc::from("b"), Arc::from("B")).unwrap();
+        config
+            .add_segment_group(
+                Arc::from("ab"),
+                Arc::from("AB"),
+                Arc::from([Arc::from("a"), Arc::from("b")]),
+            )
+            .unwrap();
+        config.save().unwrap();
+        assert_eq!(config.parts().len(), 3);
+        {
+            let input = Input::collect(
+                ["<>", "delete", "--id-name", "a", "--recursive"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap();
+            let custom_input = TestCustomInput::empty();
+            let custom_output = TestCustomOutput::new();
+            let error = coerce_pattern!(
+                run_application_base(
+                    input,
+                    config,
+                    custom_input,
+                    &custom_output
+                ),
+                Err(Error::CouldNotReadFromStdin { error }),
+                error
+            );
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            let custom_output = custom_output.consume();
+            assert_eq!(custom_output.len(), 1);
+            assert_eq!(
+                coerce_pattern!(
+                    &custom_output[0],
+                    TestOutputMessage {
+                        is_error: false,
+                        message
+                    },
+                    message
+                ) as &str,
+                "Recursive deletion of part with ID name \"a\" would result in deletion of 2 parts: [\"a\", \"ab\"]. Enter \"yes\" to confirm:"
+            );
+        }
+        let config = Config::load(root.clone()).unwrap();
+        assert_eq!(config.parts().len(), 3);
+        {
+            let input = Input::collect(
+                ["<>", "delete", "--id-name", "a", "--recursive"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap();
+            let custom_input =
+                TestCustomInput::new([(String::from("no"), 0)].into_iter());
+            let custom_output = TestCustomOutput::new();
+            run_application_base(input, config, custom_input, &custom_output)
+                .unwrap();
+            let custom_output = custom_output.consume();
+            assert_eq!(custom_output.len(), 2);
+            assert_eq!(
+                coerce_pattern!(
+                    &custom_output[0],
+                    TestOutputMessage {
+                        is_error: false,
+                        message
+                    },
+                    message
+                ) as &str,
+                "Recursive deletion of part with ID name \"a\" would result in deletion of 2 parts: [\"a\", \"ab\"]. Enter \"yes\" to confirm:"
+            );
+            assert_eq!(
+                coerce_pattern!(
+                    &custom_output[1],
+                    TestOutputMessage {
+                        is_error: false,
+                        message
+                    },
+                    message
+                ) as &str,
+                "Ok! Deleting nothing."
+            );
+        }
+        let config = Config::load(root.clone()).unwrap();
+        assert_eq!(config.parts().len(), 3);
+        {
+            let input = Input::collect(
+                ["<>", "delete", "--id-name", "a", "--recursive"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap();
+            let custom_input =
+                TestCustomInput::new([(String::from("yEs"), 0)].into_iter());
+            let custom_output = TestCustomOutput::new();
+            run_application_base(input, config, custom_input, &custom_output)
+                .unwrap();
+            let custom_output = custom_output.consume();
+            assert_eq!(custom_output.len(), 2);
+            assert_eq!(
+                coerce_pattern!(
+                    &custom_output[0],
+                    TestOutputMessage {
+                        is_error: false,
+                        message
+                    },
+                    message
+                ) as &str,
+                "Recursive deletion of part with ID name \"a\" would result in deletion of 2 parts: [\"a\", \"ab\"]. Enter \"yes\" to confirm:"
+            );
+            assert_eq!(
+                coerce_pattern!(
+                    &custom_output[1],
+                    TestOutputMessage {
+                        is_error: false,
+                        message
+                    },
+                    message
+                ) as &str,
+                "Ok! Deleting all 2 of these parts."
+            );
+        }
+        let config = Config::load(root.clone()).unwrap();
+        assert_eq!(config.parts().len(), 1);
+        assert!(config.parts().contains_key("b"));
+        {
+            let input = Input::collect(
+                ["<>", "delete", "--id-name", "b", "--recursive"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap();
+            let custom_input = TestCustomInput::empty();
+            let custom_output = TestCustomOutput::new();
+            run_application_base(input, config, custom_input, &custom_output)
+                .unwrap();
+        }
+        let config = Config::load(root.clone()).unwrap();
+        assert!(config.parts().is_empty());
     }
 }
