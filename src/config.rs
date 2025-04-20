@@ -639,6 +639,14 @@ impl<'a> Config {
         }
     }
 
+    /// Prints a string with one line per segment. Each segment is specified by its full
+    /// branch, i.e. <group display name>, <group display name>, <segment display name>
+    /// separated by tabs. However, if a group continues from one segment to the next, it
+    /// is omitted and replaced by a number of spaces equal to the length of the name.
+    pub fn run_tree(&'a self, id_name: &'a str) -> Result<String> {
+        self.use_run_info(id_name, |root| root.tree())
+    }
+
     pub fn run(
         &self,
         id_name: &str,
@@ -944,7 +952,10 @@ mod tests {
         let group_id_name = "e";
         let mut segment_names = config
             .use_run_info(group_id_name, |run_info| {
-                assert!(run_info.nested_segment_specs().is_empty());
+                let mut nested_segment_specs =
+                    run_info.nested_segment_specs().into_iter();
+                assert!(nested_segment_specs.next().unwrap().is_empty());
+                assert!(nested_segment_specs.next().is_none());
                 run_info
                     .run_segments()
                     .into_iter()

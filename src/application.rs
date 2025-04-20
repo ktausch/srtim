@@ -58,6 +58,15 @@ they actually want to delete all of the dependencies.
 
 `srtim delete --id-name <ID_NAME> [--recursive]`
 
+----
+tree
+----
+
+Prints the full segment specification, i.e. fully nested set of group and segment names
+of a given part. This includes the full nesting.
+
+`srtim tree --id-name <ID_NAME>`
+
 ---
 run
 ---
@@ -194,6 +203,21 @@ where
     Ok(())
 }
 
+/// Creates and writes the tree string for the
+/// run specified by the --id-name in input.
+fn tree_from_input<O>(
+    mut input: Input,
+    config: Config,
+    custom_output: &O,
+) -> Result<()>
+where
+    O: CustomOutput,
+{
+    let id_name = input.extract_option_single_value("--id-name")?;
+    custom_output.println(config.run_tree(&id_name)?);
+    Ok(())
+}
+
 /// Runs the segment using string input
 fn run_part_from_input<I, O>(
     mut input: Input,
@@ -327,6 +351,7 @@ where
         "delete" => {
             delete_part_from_input(input, config, custom_input, custom_output)
         }
+        "tree" => tree_from_input(input, config, custom_output),
         "help" => Ok(custom_output.println(String::from(HELP_MESSAGE))),
         other => {
             return Err(Error::UnknownMode {
@@ -1211,5 +1236,173 @@ mod tests {
         }
         let config = Config::load(root.clone()).unwrap();
         assert!(config.parts().is_empty());
+    }
+
+    /// Ensures that the tree command returns an
+    /// error if no --id-name option is provided
+    #[test]
+    fn test_tree_from_input_no_id() {
+        let config = Config::new(temp_dir().join("test_tree_from_input_no_id"));
+        let input =
+            Input::collect(["<>", "tree"].into_iter().map(String::from))
+                .unwrap();
+        let custom_output = TestCustomOutput::new();
+        assert_eq!(
+            &coerce_pattern!(
+                run_application_base(
+                    input,
+                    config,
+                    TestCustomInput::empty(),
+                    &custom_output,
+                ),
+                Err(Error::OptionNotFound { option }),
+                option
+            ) as &str,
+            "--id-name"
+        );
+    }
+
+    /// Ensures that the tree command returns an error if an ID name is
+    /// given that doesn't have a corresponding part in the config.
+    #[test]
+    fn test_tree_from_input_unknown_id() {
+        let config =
+            Config::new(temp_dir().join("test_tree_from_input_unknown_id"));
+        let input = Input::collect(
+            ["<>", "tree", "--id-name", "unknown"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        let custom_output = TestCustomOutput::new();
+        assert_eq!(
+            &coerce_pattern!(
+                run_application_base(
+                    input,
+                    config,
+                    TestCustomInput::empty(),
+                    &custom_output,
+                ),
+                Err(Error::IdNameNotFound { id_name }),
+                id_name
+            ) as &str,
+            "unknown"
+        );
+    }
+
+    /// Tests that the tree command prints the display name of
+    /// the segment if a single segment's ID name is passed in.
+    #[test]
+    fn test_tree_from_input_single_segment() {
+        let mut config =
+            Config::new(temp_dir().join("test_tree_from_input_single_segment"));
+        config.add_segment(Arc::from("a"), Arc::from("A")).unwrap();
+        let input = Input::collect(
+            ["<>", "tree", "--id-name", "a"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        let custom_output = TestCustomOutput::new();
+        run_application_base(
+            input,
+            config,
+            TestCustomInput::empty(),
+            &custom_output,
+        )
+        .unwrap();
+        let custom_output = custom_output.consume();
+        assert_eq!(custom_output.len(), 1);
+        assert_eq!(
+            coerce_pattern!(
+                &custom_output[0],
+                TestOutputMessage {
+                    is_error: false,
+                    message
+                },
+                message
+            ) as &str,
+            "A"
+        );
+    }
+
+    /// Tests that the tree command prints the entire nested
+    /// segment tree if a group's ID name is passed in.
+    #[test]
+    fn test_tree_from_input_segment_group() {
+        let mut config =
+            Config::new(temp_dir().join("test_tree_from_input_segment_group"));
+        config.add_segment(Arc::from("a"), Arc::from("A")).unwrap();
+        config
+            .add_segment_group(
+                Arc::from("aa"),
+                Arc::from("AA"),
+                Arc::from([Arc::from("a"), Arc::from("a")]),
+            )
+            .unwrap();
+        config
+            .add_segment_group(
+                Arc::from("aaa"),
+                Arc::from("AAA"),
+                Arc::from([Arc::from("aa"), Arc::from("a")]),
+            )
+            .unwrap();
+        let input = Input::collect(
+            ["<>", "tree", "--id-name", "aaa"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        let custom_output = TestCustomOutput::new();
+        run_application_base(
+            input,
+            config,
+            TestCustomInput::empty(),
+            &custom_output,
+        )
+        .unwrap();
+        let custom_output = custom_output.consume();
+        assert_eq!(custom_output.len(), 1);
+        assert_eq!(
+            coerce_pattern!(
+                &custom_output[0],
+                TestOutputMessage {
+                    is_error: false,
+                    message
+                },
+                message
+            ) as &str,
+            "\
+AAA\tAA\tA
+   \t  \tA
+   \tA"
+        );
+    }
+
+    /// Tests that when the help subcommand is passed in. The application
+    /// exits successfully after printing the pre-written help message.
+    #[test]
+    fn test_help_from_input() {
+        let config = Config::new(temp_dir().join("test_help_from_input"));
+        let input =
+            Input::collect(["<>", "help"].into_iter().map(String::from))
+                .unwrap();
+        let custom_input = TestCustomInput::empty();
+        let custom_output = TestCustomOutput::new();
+        run_application_base(input, config, custom_input, &custom_output)
+            .unwrap();
+        let custom_output = custom_output.consume();
+        assert_eq!(custom_output.len(), 1);
+        assert_eq!(
+            coerce_pattern!(
+                &custom_output[0],
+                TestOutputMessage {
+                    is_error: false,
+                    message
+                },
+                message
+            ) as &str,
+            HELP_MESSAGE
+        );
     }
 }
