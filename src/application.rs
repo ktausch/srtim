@@ -352,6 +352,10 @@ where
             delete_part_from_input(input, config, custom_input, custom_output)
         }
         "tree" => tree_from_input(input, config, custom_output),
+        "list" => {
+            custom_output.println(config.list());
+            Ok(())
+        }
         "help" => Ok(custom_output.println(String::from(HELP_MESSAGE))),
         other => {
             return Err(Error::UnknownMode {
@@ -1376,6 +1380,44 @@ mod tests {
 AAA\tAA\tA
    \t  \tA
    \tA"
+        );
+    }
+
+    /// Tests that the list subcommand correctly prints the config's part list.
+    #[test]
+    fn test_list() {
+        let mut config = Config::new(temp_dir().join("test_list_app"));
+        config.add_segment(Arc::from("a"), Arc::from("B")).unwrap();
+        config.add_segment(Arc::from("c"), Arc::from("A")).unwrap();
+        config
+            .add_segment_group(
+                Arc::from("b"),
+                Arc::from("C"),
+                Arc::from([Arc::from("c"), Arc::from("a")]),
+            )
+            .unwrap();
+        let input =
+            Input::collect(["<>", "list"].into_iter().map(String::from))
+                .unwrap();
+        let custom_input = TestCustomInput::empty();
+        let custom_output = TestCustomOutput::new();
+        run_application_base(input, config, custom_input, &custom_output)
+            .unwrap();
+        let custom_output = custom_output.consume();
+        assert_eq!(custom_output.len(), 1);
+        assert_eq!(
+            coerce_pattern!(
+                &custom_output[0],
+                TestOutputMessage {
+                    is_error: false,
+                    message
+                },
+                message
+            ) as &str,
+            "\
+a: B\tSegment
+b: C\tGroup
+c: A\tSegment"
         );
     }
 

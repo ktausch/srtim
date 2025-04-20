@@ -647,6 +647,46 @@ impl<'a> Config {
         self.use_run_info(id_name, |root| root.tree())
     }
 
+    /// Lists all segments and groups.
+    pub fn list(&'a self) -> String {
+        let mut sorted_keys = Vec::with_capacity(self.parts.len());
+        for key in self.parts.keys() {
+            sorted_keys.push(key as &str);
+        }
+        sorted_keys.sort();
+        let mut result = String::new();
+        let mut sorted_keys = sorted_keys.into_iter();
+        let mut key = match sorted_keys.next() {
+            None => {
+                return result;
+            }
+            Some(key) => key,
+        };
+        loop {
+            let (display_name, is_group) = match &self.parts[key] {
+                ConfigPart::Segment(segment_info) => {
+                    (&segment_info.display_name, false)
+                }
+                ConfigPart::Group(segment_group_info) => {
+                    (&segment_group_info.display_name, true)
+                }
+            };
+            result.push_str(key);
+            result.push_str(": ");
+            result.push_str(display_name);
+            result.push('\t');
+            result.push_str(if is_group { "Group" } else { "Segment" });
+            key = match sorted_keys.next() {
+                None => break,
+                Some(key) => key,
+            };
+            result.push('\n');
+        }
+        result
+    }
+
+    /// Receives SegmentRunEvents and generates SupplementedSegmentRuns
+    /// for all segments and groups when they end.
     pub fn run(
         &self,
         id_name: &str,
@@ -1669,5 +1709,37 @@ mod tests {
         assert!(config.parts.contains_key("b"));
         assert!(config.parts.contains_key("c"));
         assert!(config.parts.contains_key("bc"));
+    }
+
+    /// Tests that the list string of an empty config is the empty string.
+    #[test]
+    fn test_list_empty() {
+        let config = Config::new(temp_dir().join("test_list_empty"));
+        assert!(config.list().is_empty());
+    }
+
+    /// Tests that the list string of a config orders parts alphabetically
+    /// with ID name and includes the display name and whether it is a
+    /// segment or a group of segments.
+    #[test]
+    fn test_list() {
+        let (config, _temp_file) = make_abcd_config("test_list");
+        assert_eq!(
+            config.list().as_str(),
+            "\
+a: A\tSegment
+ab: AB\tGroup
+ababc: ABABC\tGroup
+abc: ABC\tGroup
+abcd: ABCD\tGroup
+abcdf: ABCDF\tGroup
+abcdfg: ABCDFG\tGroup
+b: B\tSegment
+c: C\tSegment
+d: D\tSegment
+e: E\tSegment
+f: F\tSegment
+g: G\tSegment"
+        );
     }
 }
