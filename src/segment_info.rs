@@ -178,7 +178,7 @@ impl<'a> RunPart<'a> {
             RunPart::Group { components, .. } => {
                 nested_segment_specs_from_parts_slice(components)
             }
-            _ => vec![],
+            _ => vec![vec![]],
         }
     }
 
@@ -222,6 +222,62 @@ impl<'a> RunPart<'a> {
         }
     }
 
+    /// Creates a string with one line per segment. Each segment is specified by its full
+    /// branch, i.e. <group display name>, <group display name>, <segment display name>
+    /// separated by tabs. However, if a group continues from one segment to the next, it
+    /// is omitted and replaced by a number of spaces equal to the length of the name.
+    pub fn tree(&'a self) -> String {
+        let mut result = String::new();
+        let mut segment_specs = self.nested_segment_specs().into_iter();
+        let mut last_segment_spec: Vec<(usize, &'a RunPart<'a>)> = Vec::new();
+        let mut first_iteration = true;
+        loop {
+            let segment_spec = match segment_specs.next() {
+                None => break,
+                Some(incomplete_segment_spec) => {
+                    let mut segment_spec =
+                        Vec::with_capacity(incomplete_segment_spec.len() + 1);
+                    segment_spec.push((0, self));
+                    for part in incomplete_segment_spec {
+                        segment_spec.push(part);
+                    }
+                    segment_spec
+                }
+            };
+            let equal_display_name_lengths: Vec<usize> = zip_same(
+                last_segment_spec
+                    .iter()
+                    .map(|(index, part)| (index, part.display_name())),
+                segment_spec
+                    .iter()
+                    .map(|(index, part)| (index, part.display_name())),
+            )
+            .map(|(_, display_name)| display_name.len())
+            .collect();
+            if first_iteration {
+                first_iteration = false;
+            } else {
+                result.push('\n');
+            }
+            equal_display_name_lengths.iter().for_each(
+                |&equal_display_name_length| {
+                    for _ in 0..equal_display_name_length {
+                        result.push(' ');
+                    }
+                    result.push('\t');
+                },
+            );
+            for index in equal_display_name_lengths.len()..segment_spec.len() {
+                result.push_str(segment_spec[index].1.display_name());
+                if index + 1 != segment_spec.len() {
+                    result.push_str("\t");
+                }
+            }
+            last_segment_spec = segment_spec;
+        }
+        result
+    }
+
     /// Starts a timed run using this RunPart as the root of the run tree
     ///
     /// Args:
@@ -249,19 +305,13 @@ impl<'a> RunPart<'a> {
             };
         let (segment_run_sender, segment_run_receiver) = mpsc::channel();
         let nested_segment_names = self.nested_segment_names();
-        let num_segments = match nested_segment_names.len() {
-            0 => 1usize,
-            num_segments => num_segments,
-        };
+        let num_segments = nested_segment_names.len();
         let top_level_name = self.display_name().clone();
         let top_level_path = PathBuf::from(self.file_name());
         let mut maybe_top_level_accumulation: Option<SegmentRun> = None;
         let tagging_thread = thread::spawn(move || {
             let mut nested_segment_names = nested_segment_names.into_iter();
-            let mut last_segment_names = match nested_segment_names.next() {
-                Some(last_segment_names) => last_segment_names,
-                None => vec![],
-            };
+            let mut last_segment_names = nested_segment_names.next().unwrap();
             let mut accumulations: HashMap<Arc<str>, SegmentRun> =
                 HashMap::new();
             loop {
@@ -604,5 +654,47 @@ mod tests {
         let expected_d_segment = segments.next().unwrap();
         assert!(ptr::eq(actual_d_segment, expected_d_segment));
         assert!(segments.next().is_none());
+    }
+
+    /// Tests the tree method with ((AA)(AA)). This nested structure where the same
+    /// part names show up back-to-back at multiple levels of nesting shows that
+    /// the correct things are printed vs ignored (i.e. if the same instance of a
+    /// group continues over multiple lines, it shouldn't appear more than once)
+    #[test]
+    fn test_tree_nested_with_repeats() {
+        let a =
+            SegmentInfo::new(Arc::from("A"), PathBuf::from("/a.txt")).unwrap();
+        let a_part = RunPart::SingleSegment(&a);
+        let aa_file_name = PathBuf::from("/aa.txt");
+        let aa_part = RunPart::Group {
+            components: Arc::from([&a_part, &a_part]),
+            display_name: Arc::from("AA"),
+            file_name: &aa_file_name,
+        };
+        let aaaa_file_name = PathBuf::from("/aaaa.txt");
+        let aaaa_part = RunPart::Group {
+            components: Arc::from([&aa_part, &aa_part]),
+            display_name: Arc::from("AAAA"),
+            file_name: &aaaa_file_name,
+        };
+        let tree_string = aaaa_part.tree();
+        assert_eq!(
+            tree_string.as_str(),
+            "\
+AAAA\tAA\tA
+    \t  \tA
+    \tAA\tA
+    \t  \tA"
+        );
+    }
+
+    /// Tests the tree function on a single segment part, which
+    /// should simply print the display name of the segment.
+    #[test]
+    fn test_tree_single_segment() {
+        let a =
+            SegmentInfo::new(Arc::from("A"), PathBuf::from("/a.txt")).unwrap();
+        let a_part = RunPart::SingleSegment(&a);
+        assert_eq!(a_part.tree().as_str(), "A")
     }
 }
