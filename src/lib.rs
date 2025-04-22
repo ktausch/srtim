@@ -13,5 +13,6 @@ pub use config::Config;
 pub use error::{Error, Result};
 pub use input::Input;
 pub use segment_run::{
-    MillisecondsSinceEpoch, SegmentRunEvent, SupplementedSegmentRun,
+    BasicStats, MillisecondsSinceEpoch, SegmentRunEvent, SegmentStats,
+    SupplementedSegmentRun,
 };

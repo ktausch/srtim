@@ -9,7 +9,9 @@ use crate::coerce_pattern;
 
 use crate::error::{Error, Result};
 use crate::segment_info::{RunPart, SegmentGroupInfo, SegmentInfo};
-use crate::segment_run::{SegmentRunEvent, SupplementedSegmentRun};
+use crate::segment_run::{
+    SegmentRunEvent, SegmentStats, SupplementedSegmentRun,
+};
 use crate::utils::load_n_tokens;
 
 /// the component separator is used to specify parts of a group
@@ -371,6 +373,44 @@ impl Config {
         file.sync_all().unwrap();
         Ok(())
     }
+
+    /// Lists all segments and groups.
+    pub fn list(&self) -> String {
+        let mut sorted_keys = Vec::with_capacity(self.parts.len());
+        for key in self.parts.keys() {
+            sorted_keys.push(key as &str);
+        }
+        sorted_keys.sort();
+        let mut result = String::new();
+        let mut sorted_keys = sorted_keys.into_iter();
+        let mut key = match sorted_keys.next() {
+            None => {
+                return result;
+            }
+            Some(key) => key,
+        };
+        loop {
+            let (display_name, is_group) = match &self.parts[key] {
+                ConfigPart::Segment(segment_info) => {
+                    (&segment_info.display_name, false)
+                }
+                ConfigPart::Group(segment_group_info) => {
+                    (&segment_group_info.display_name, true)
+                }
+            };
+            result.push_str(key);
+            result.push_str(": ");
+            result.push_str(display_name);
+            result.push('\t');
+            result.push_str(if is_group { "Group" } else { "Segment" });
+            key = match sorted_keys.next() {
+                None => break,
+                Some(key) => key,
+            };
+            result.push('\n');
+        }
+        result
+    }
 }
 
 /// A struct that stores run parts at each level of nesting:
@@ -492,7 +532,7 @@ where
     }
 }
 
-impl<'a> Config {
+impl Config {
     /// Finds the order of all ConfigParts relevant to the given ID name. For example:
     /// - if the ID name is a segment, returns a hash map containing only (id_name, 0)
     /// - if the ID name is a group, then returns a hash map whose keys are the names
@@ -502,7 +542,10 @@ impl<'a> Config {
     ///
     /// The returned map is guaranteed to be non-empty if it exists. None is only returned
     /// if there is no group or segment by the given name.
-    fn order(&'a self, id_name: &'a str) -> Option<HashMap<&'a str, usize>> {
+    fn order<'a>(
+        &'a self,
+        id_name: &'a str,
+    ) -> Option<HashMap<&'a str, usize>> {
         let mut result: HashMap<&'a str, usize> = HashMap::new();
         let mut stack: Vec<&'a str> = vec![id_name];
         while let Some(current) = stack.pop() {
@@ -545,7 +588,7 @@ impl<'a> Config {
     }
 
     /// Constructs a run tree and runs the given function on it, returning the result of the function.
-    fn use_run_info<F, R>(&'a self, id_name: &'a str, f: F) -> Result<R>
+    fn use_run_info<F, R>(&self, id_name: &str, f: F) -> Result<R>
     where
         F: FnOnce(&RunPart) -> R,
     {
@@ -643,46 +686,8 @@ impl<'a> Config {
     /// branch, i.e. <group display name>, <group display name>, <segment display name>
     /// separated by tabs. However, if a group continues from one segment to the next, it
     /// is omitted and replaced by a number of spaces equal to the length of the name.
-    pub fn run_tree(&'a self, id_name: &'a str) -> Result<String> {
+    pub fn run_tree(&self, id_name: &str) -> Result<String> {
         self.use_run_info(id_name, |root| root.tree())
-    }
-
-    /// Lists all segments and groups.
-    pub fn list(&'a self) -> String {
-        let mut sorted_keys = Vec::with_capacity(self.parts.len());
-        for key in self.parts.keys() {
-            sorted_keys.push(key as &str);
-        }
-        sorted_keys.sort();
-        let mut result = String::new();
-        let mut sorted_keys = sorted_keys.into_iter();
-        let mut key = match sorted_keys.next() {
-            None => {
-                return result;
-            }
-            Some(key) => key,
-        };
-        loop {
-            let (display_name, is_group) = match &self.parts[key] {
-                ConfigPart::Segment(segment_info) => {
-                    (&segment_info.display_name, false)
-                }
-                ConfigPart::Group(segment_group_info) => {
-                    (&segment_group_info.display_name, true)
-                }
-            };
-            result.push_str(key);
-            result.push_str(": ");
-            result.push_str(display_name);
-            result.push('\t');
-            result.push_str(if is_group { "Group" } else { "Segment" });
-            key = match sorted_keys.next() {
-                None => break,
-                Some(key) => key,
-            };
-            result.push('\n');
-        }
-        result
     }
 
     /// Receives SegmentRunEvents and generates SupplementedSegmentRuns
@@ -708,18 +713,24 @@ impl<'a> Config {
             Err(error) => Err(error),
         }
     }
+
+    /// Gets the best, worst, mean, and median duration and death of given part
+    pub fn get_stats(&self, id_name: &str) -> Result<Option<SegmentStats>> {
+        self.use_run_info(id_name, |run_part| run_part.get_stats())?
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env::temp_dir;
+    use std::ptr;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
     use crate::assert_pattern;
-    use crate::segment_run::SegmentRun;
+    use crate::segment_run::{MillisecondsSinceEpoch, SegmentRun};
     use crate::utils::TempFile;
 
     /// Makes a config containing
@@ -1741,5 +1752,55 @@ e: E\tSegment
 f: F\tSegment
 g: G\tSegment"
         );
+    }
+
+    /// Ensures that the same str objects underly the ID names that are
+    /// keys of config.parts and elements of the part_id_names list.
+    #[test]
+    fn test_min_allocations() {
+        let (config, _temp_file) = make_abcd_config("test_min_allocations");
+        let a_key = config.parts.get_key_value("a").unwrap().0 as &str;
+        let ab_part_id = &coerce_pattern!(
+            config.parts.get("ab").unwrap(),
+            ConfigPart::Group(SegmentGroupInfo { part_id_names, .. }),
+            part_id_names
+        )[0] as &str;
+        assert!(ptr::eq(a_key, ab_part_id));
+    }
+
+    /// Tests the three main ways get_stats can return:
+    /// 1. if no config part has that ID name, an
+    ///    Err(Error::IdNameNotFound) is returned
+    /// 2. if the config part has no saved segments, Ok(None) is returned
+    /// 3. if the config part has saved segments, Ok(stats) are returned
+    #[test]
+    fn test_get_stats() {
+        let (config, _temp_file) = make_abcd_config("test_get_stats");
+        config.save().unwrap();
+        assert_eq!(
+            &coerce_pattern!(
+                config.get_stats("z"),
+                Err(Error::IdNameNotFound { id_name }),
+                id_name
+            ) as &str,
+            "z"
+        );
+        assert!(config.get_stats("b").unwrap().is_none());
+        SegmentRun {
+            deaths: 0,
+            start: MillisecondsSinceEpoch(0),
+            end: MillisecondsSinceEpoch(10000),
+        }
+        .save(&config.root.join("a.csv"))
+        .unwrap();
+        let stats = config.get_stats("a").unwrap().unwrap();
+        assert_eq!(Duration::from_secs(10), stats.durations.best);
+        assert_eq!(Duration::from_secs(10), stats.durations.worst);
+        assert_eq!(Duration::from_secs(10), stats.durations.mean);
+        assert_eq!(Duration::from_secs(10), stats.durations.median);
+        assert_eq!(0u32, stats.deaths.best);
+        assert_eq!(0u32, stats.deaths.worst);
+        assert_eq!(0f32, stats.deaths.mean);
+        assert_eq!(0f32, stats.deaths.median);
     }
 }

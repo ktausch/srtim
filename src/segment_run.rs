@@ -2,6 +2,7 @@
 use std::fmt::{self, Debug, Display};
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::ops::{Div, Rem};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -43,6 +44,129 @@ impl MillisecondsSinceEpoch {
             })
         }
     }
+}
+
+/// Finds the quotient and remainder when dividing numerator by denominator.
+///
+/// This function panics if denominator is zero!
+fn divide_with_remainder<I>(numerator: I, denominator: I) -> (I, I)
+where
+    I: Div<Output = I> + Rem<Output = I> + Copy,
+{
+    (numerator / denominator, numerator % denominator)
+}
+
+/// Description of how an object should be printed
+enum PrintStrategy {
+    /// Nothing is printed
+    DoNotShow,
+    /// Prints with a fill character if the object is too short
+    LeftFill {
+        /// string literal printed after the (possibly padded) object
+        after: &'static str,
+        /// the character used to fill on the left
+        fill: char,
+        /// fill character is used until this width is reached
+        width: usize,
+    },
+    /// prints the object directly with no filling
+    NoFill {
+        /// string literal printed after the object
+        after: &'static str,
+    },
+}
+
+impl PrintStrategy {
+    /// Prints the object to the buffer based on this strategy
+    fn print<T>(&self, object: T, buffer: &mut String)
+    where
+        T: Display,
+    {
+        match self {
+            &PrintStrategy::DoNotShow => {}
+            &PrintStrategy::LeftFill { fill, width, after } => {
+                let object = format!("{object}");
+                for _ in object.len()..width {
+                    buffer.push(fill);
+                }
+                buffer.push_str(&object);
+                if !after.is_empty() {
+                    buffer.push_str(after);
+                }
+            }
+            &PrintStrategy::NoFill { after } => {
+                buffer.push_str(format!("{object}").as_str());
+                if !after.is_empty() {
+                    buffer.push_str(after);
+                }
+            }
+        }
+    }
+}
+
+/// Formats a duration so in the first of the following formats that is valid:
+/// - S.MMM s
+/// - M:SS.MMM
+/// - H:MM:SS.MMM
+pub fn format_duration(duration: Duration) -> String {
+    let running = duration.as_millis();
+    let (running, milliseconds) = divide_with_remainder(running, 1000);
+    let (running, seconds) = divide_with_remainder(running, 60);
+    let (hours, minutes) = divide_with_remainder(running, 60);
+    let (ms_ps, s_ps, min_ps, h_ps) = if hours == 0 {
+        let h_ps = PrintStrategy::DoNotShow;
+        let (ms_ps, s_ps, min_ps) = if minutes == 0 {
+            (
+                PrintStrategy::LeftFill {
+                    after: " s",
+                    fill: '0',
+                    width: 3,
+                },
+                PrintStrategy::NoFill { after: "." },
+                PrintStrategy::DoNotShow,
+            )
+        } else {
+            (
+                PrintStrategy::LeftFill {
+                    after: "",
+                    fill: '0',
+                    width: 3,
+                },
+                PrintStrategy::LeftFill {
+                    after: ".",
+                    fill: '0',
+                    width: 2,
+                },
+                PrintStrategy::NoFill { after: ":" },
+            )
+        };
+        (ms_ps, s_ps, min_ps, h_ps)
+    } else {
+        (
+            PrintStrategy::LeftFill {
+                after: "",
+                fill: '0',
+                width: 3,
+            },
+            PrintStrategy::LeftFill {
+                after: ".",
+                fill: '0',
+                width: 2,
+            },
+            PrintStrategy::LeftFill {
+                after: ":",
+                fill: '0',
+                width: 2,
+            },
+            PrintStrategy::NoFill { after: ":" },
+        )
+    };
+    let mut result = String::with_capacity(15);
+    h_ps.print(hours, &mut result);
+    min_ps.print(minutes, &mut result);
+    s_ps.print(seconds, &mut result);
+    ms_ps.print(milliseconds, &mut result);
+    result
 }
 
 /// An event that can take place during a segment
@@ -241,6 +365,84 @@ pub struct SupplementedSegmentRun {
     pub name: Arc<str>,
     /// number of deaths and start and end times of the part that was just completed
     pub segment_run: SegmentRun,
+}
+
+/// A struct containing basic stats (min, max, mean, median) for a set of values
+pub struct BasicStats<T, M> {
+    /// the best run
+    pub best: T,
+    /// the worst run
+    pub worst: T,
+    /// the average of all of the runs
+    pub mean: M,
+    /// the median of all of the runs
+    pub median: M,
+}
+
+/// Contains basic stats for both duration and death count.
+pub struct SegmentStats {
+    /// the number of runs that went into making the stats
+    pub num_runs: u32,
+    /// the min, max, mean, and median duration
+    pub durations: BasicStats<Duration, Duration>,
+    /// the min, max, mean, and median number of deaths
+    pub deaths: BasicStats<u32, f32>,
+}
+
+impl SegmentStats {
+    /// Computes the min, max, mean, and median of the duration
+    /// and death count of all runs in the slice.
+    pub fn from_runs(runs: &[SegmentRun]) -> Option<SegmentStats> {
+        let num_runs = runs.len();
+        let mut runs = (&runs as &[SegmentRun]).into_iter();
+        let run = runs.next()?;
+        let duration = run.duration();
+        let mut sum_deaths = run.deaths;
+        let mut sum_duration = duration.as_millis();
+        let mut durations = Vec::with_capacity(num_runs);
+        let mut deaths = Vec::with_capacity(num_runs);
+        durations.push(sum_duration);
+        deaths.push(sum_deaths);
+        while let Some(run) = runs.next() {
+            let milliseconds = run.duration().as_millis();
+            sum_duration += milliseconds;
+            sum_deaths += run.deaths;
+            durations.push(milliseconds);
+            deaths.push(run.deaths);
+        }
+        durations.sort_unstable();
+        deaths.sort_unstable();
+        Some(SegmentStats {
+            num_runs: (num_runs as u32),
+            durations: BasicStats {
+                best: Duration::from_millis(
+                    (*durations.first().unwrap()).try_into().unwrap(),
+                ),
+                worst: Duration::from_millis(
+                    (*durations.last().unwrap()).try_into().unwrap(),
+                ),
+                mean: Duration::from_millis(
+                    (sum_duration / (num_runs as u128)).try_into().unwrap(),
+                ),
+                median: Duration::from_millis(
+                    ((durations[durations.len() / 2]
+                        + durations[(durations.len() - 1) / 2])
+                        / 2)
+                    .try_into()
+                    .unwrap(),
+                ),
+            },
+            deaths: BasicStats {
+                best: *deaths.first().unwrap(),
+                worst: *deaths.last().unwrap(),
+                mean: (sum_deaths as f32) / (num_runs as f32),
+                median: (((deaths[deaths.len() / 2]
+                    + deaths[(deaths.len() - 1) / 2])
+                    as f32)
+                    / (2 as f32)),
+            },
+        })
+    }
 }
 
 #[cfg(test)]
@@ -563,5 +765,197 @@ mod tests {
             fs::read_to_string(path).unwrap().as_str(),
             "start,end,deaths\n1000,91000,3\n100000,200000,1\n"
         );
+    }
+
+    /// Creates and fills a string using the given PrintStrategy
+    /// to make a string of the given object.
+    fn print_owned<T>(print_strategy: &PrintStrategy, object: T) -> String
+    where
+        T: Display,
+    {
+        let mut buffer = String::new();
+        print_strategy.print(object, &mut buffer);
+        buffer
+    }
+
+    /// Ensures that the DoNotShow strategy causes nothing to be written.
+    #[test]
+    fn test_print_strategy_do_not_show() {
+        let do_not_show = PrintStrategy::DoNotShow;
+        assert!(print_owned(&do_not_show, "a").is_empty());
+        assert!(print_owned(&do_not_show, 1).is_empty());
+        assert!(print_owned(&do_not_show, String::from("b")).is_empty());
+    }
+
+    /// Ensures that the left fill PrintStrategy correctly pads with
+    /// fill characters for short-string objects and does no padding
+    /// for long-string objects. Also ensures that the "after" string
+    /// literal is printed correctly at the end.
+    #[test]
+    fn test_print_srategy_left_fill() {
+        let left_fill = PrintStrategy::LeftFill {
+            after: "hello!",
+            fill: '0',
+            width: 4,
+        };
+        assert_eq!(print_owned(&left_fill, 1).as_str(), "0001hello!");
+        assert_eq!(print_owned(&left_fill, "abcde").as_str(), "abcdehello!");
+        let left_fill = PrintStrategy::LeftFill {
+            after: "",
+            fill: '-',
+            width: 4,
+        };
+        assert_eq!(print_owned(&left_fill, "bed").as_str(), "-bed");
+        assert_eq!(print_owned(&left_fill, "").as_str(), "----");
+    }
+
+    /// Ensures that the no fill PrintStrategy directly prints
+    /// the object and the "after" string literal.
+    #[test]
+    fn test_print_strategy_no_fill() {
+        let no_fill = PrintStrategy::NoFill {
+            after: "totallyrandom",
+        };
+        assert_eq!(print_owned(&no_fill, 1001).as_str(), "1001totallyrandom");
+        assert_eq!(print_owned(&no_fill, "a").as_str(), "atotallyrandom");
+        let no_fill = PrintStrategy::NoFill { after: "" };
+        assert_eq!(print_owned(&no_fill, 1001).as_str(), "1001");
+        assert_eq!(print_owned(&no_fill, "a").as_str(), "a");
+    }
+
+    /// Ensures that divide_with_remainder panics if passed a zero denominator.
+    #[test]
+    #[should_panic]
+    fn test_divide_with_remainder_zero_denominator() {
+        divide_with_remainder(1, 0);
+    }
+
+    /// Tests the divide_with_remainder function with various integer types.
+    #[test]
+    fn test_divide_with_remainder() {
+        assert_eq!(divide_with_remainder(0usize, 1usize), (0, 0));
+        assert_eq!(divide_with_remainder(648, 7), (92, 4));
+        assert_eq!(divide_with_remainder(255u8, 128u8), (1, 127));
+    }
+
+    /// Tests all different forms of Duration formatting used in the program.
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(
+            format_duration(Duration::from_millis(3724127)).as_str(),
+            "1:02:04.127"
+        );
+        assert_eq!(
+            format_duration(Duration::from_millis(3600000000)).as_str(),
+            "1000:00:00.000"
+        );
+        assert_eq!(
+            format_duration(Duration::from_millis(708846)).as_str(),
+            "11:48.846"
+        );
+        assert_eq!(
+            format_duration(Duration::from_millis(43762)).as_str(),
+            "43.762 s"
+        );
+        assert_eq!(
+            format_duration(Duration::from_millis(5683)).as_str(),
+            "5.683 s"
+        );
+        assert_eq!(
+            format_duration(Duration::from_millis(74)).as_str(),
+            "0.074 s"
+        );
+    }
+
+    /// Tests that the SegmentStats::from_runs method
+    /// returns None if there are no runs.
+    #[test]
+    fn test_stats_zero_runs() {
+        let runs = Arc::from([]);
+        assert!(SegmentStats::from_runs(&runs).is_none());
+    }
+
+    /// Tests that the SegmentStats::from_runs method has the best, worst,
+    /// mean, and median equal to the single run if there is only one.
+    #[test]
+    fn test_stats_single_run() {
+        let runs = Arc::from([SegmentRun {
+            deaths: 7,
+            start: MillisecondsSinceEpoch(0),
+            end: MillisecondsSinceEpoch(3624000),
+        }]);
+        let duration = Duration::from_secs(3624);
+        let stats = SegmentStats::from_runs(&runs).unwrap();
+        assert_eq!(stats.num_runs, 1);
+        assert_eq!(duration, stats.durations.best);
+        assert_eq!(duration, stats.durations.worst);
+        assert_eq!(duration, stats.durations.mean);
+        assert_eq!(duration, stats.durations.median);
+        assert_eq!(7u32, stats.deaths.best);
+        assert_eq!(7u32, stats.deaths.worst);
+        assert_eq!(7f32, stats.deaths.mean);
+        assert_eq!(7f32, stats.deaths.median);
+    }
+
+    /// Tests that the SegmentStats::from_runs method has the best, worst,
+    /// mean, and median equal to the expected values when there are two runs.
+    #[test]
+    fn test_stats_two_runs() {
+        let runs = Arc::from([
+            SegmentRun {
+                deaths: 7,
+                start: MillisecondsSinceEpoch(0),
+                end: MillisecondsSinceEpoch(3624000),
+            },
+            SegmentRun {
+                deaths: 6,
+                start: MillisecondsSinceEpoch(0),
+                end: MillisecondsSinceEpoch(3600000),
+            },
+        ]);
+        let stats = SegmentStats::from_runs(&runs).unwrap();
+        assert_eq!(stats.num_runs, 2);
+        assert_eq!(Duration::from_secs(3600), stats.durations.best);
+        assert_eq!(Duration::from_secs(3624), stats.durations.worst);
+        assert_eq!(Duration::from_secs(3612), stats.durations.mean);
+        assert_eq!(Duration::from_secs(3612), stats.durations.median);
+        assert_eq!(6u32, stats.deaths.best);
+        assert_eq!(7u32, stats.deaths.worst);
+        assert_eq!(6.5f32, stats.deaths.mean);
+        assert_eq!(6.5f32, stats.deaths.median);
+    }
+
+    /// Tests that the SegmentStats::from_runs method
+    /// has the best, worst, mean, and median equal to
+    /// the expected values when there are three runs.
+    #[test]
+    fn test_stats_three_runs() {
+        let runs = Arc::from([
+            SegmentRun {
+                deaths: 1,
+                start: MillisecondsSinceEpoch(0),
+                end: MillisecondsSinceEpoch(20000),
+            },
+            SegmentRun {
+                deaths: 2,
+                start: MillisecondsSinceEpoch(0),
+                end: MillisecondsSinceEpoch(30000),
+            },
+            SegmentRun {
+                deaths: 6,
+                start: MillisecondsSinceEpoch(0),
+                end: MillisecondsSinceEpoch(100000),
+            },
+        ]);
+        let stats = SegmentStats::from_runs(&runs).unwrap();
+        assert_eq!(stats.num_runs, 3);
+        assert_eq!(Duration::from_secs(20), stats.durations.best);
+        assert_eq!(Duration::from_secs(100), stats.durations.worst);
+        assert_eq!(Duration::from_secs(50), stats.durations.mean);
+        assert_eq!(Duration::from_secs(30), stats.durations.median);
+        assert_eq!(1u32, stats.deaths.best);
+        assert_eq!(6u32, stats.deaths.worst);
+        assert_eq!(3f32, stats.deaths.mean);
+        assert_eq!(2f32, stats.deaths.median);
     }
 }
