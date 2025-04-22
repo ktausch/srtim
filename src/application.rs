@@ -3,11 +3,13 @@ use std::io::{self, Write};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
+use crate::BasicStats;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::input::Input;
 use crate::segment_run::{
-    MillisecondsSinceEpoch, SegmentRunEvent, SupplementedSegmentRun,
+    MillisecondsSinceEpoch, SegmentRunEvent, SegmentStats,
+    SupplementedSegmentRun, format_duration,
 };
 
 const HELP_MESSAGE: &'static str = "\
@@ -34,6 +36,14 @@ Shows this help message.
 
 `srtim help`
 
+----
+list
+----
+
+Lists all segments and segment groups.
+
+`srtim list`
+
 ---
 add
 ---
@@ -58,6 +68,15 @@ they actually want to delete all of the dependencies.
 
 `srtim delete --id-name <ID_NAME> [--recursive]`
 
+-----
+stats
+-----
+
+Gets the best, worst, mean, and median durations (and,
+optionally death count if --include-deaths is supplied)
+
+`srtim stats --id-name <ID_NAME> [--include-deaths]`
+
 ----
 tree
 ----
@@ -77,7 +96,7 @@ end of a segment. Each non-empty line indicates a \"death\", although the applic
 expects such non-empty lines to contain the single letter \"d\". Otherwise, a message
 asking for it to be formatted that way is printed to stderr.
 
-`srtim run --id-name <ID_NAME>`
+`srtim run --id-name <ID_NAME> [--include-deaths]`
 ";
 
 /// Adds a segment or group of segments to the config!
@@ -218,6 +237,69 @@ where
     Ok(())
 }
 
+/// Gets the stats of the segment given in --id-name option.
+fn stats_from_input<O>(
+    mut input: Input,
+    config: Config,
+    custom_output: &O,
+) -> Result<()>
+where
+    O: CustomOutput,
+{
+    let id_name = input.extract_option_single_value("--id-name")?;
+    let include_deaths = input.extract_option_no_values("--include-deaths")?;
+    match config.get_stats(&id_name)? {
+        None => {
+            custom_output.println(format!(
+                "Segment with ID name \"{id_name}\" has no runs yet."
+            ));
+        }
+        Some(SegmentStats {
+            num_runs,
+            durations:
+                BasicStats {
+                    best: best_duration,
+                    worst: worst_duration,
+                    mean: mean_duration,
+                    median: median_duration,
+                },
+            deaths:
+                BasicStats {
+                    best: best_deaths,
+                    worst: worst_deaths,
+                    mean: mean_deaths,
+                    median: median_deaths,
+                },
+        }) => {
+            custom_output.println(format!("# of runs: {num_runs}"));
+            custom_output.println(format!(
+                "Best duration: {}",
+                format_duration(best_duration)
+            ));
+            custom_output.println(format!(
+                "Worst duration: {}",
+                format_duration(worst_duration)
+            ));
+            custom_output.println(format!(
+                "Mean duration: {}",
+                format_duration(mean_duration)
+            ));
+            custom_output.println(format!(
+                "Median duration: {}",
+                format_duration(median_duration)
+            ));
+            if include_deaths {
+                custom_output.println(format!("Best deaths: {best_deaths}"));
+                custom_output.println(format!("Worst deaths: {worst_deaths}"));
+                custom_output.println(format!("Mean deaths: {mean_deaths:.3}"));
+                custom_output
+                    .println(format!("Median deaths: {median_deaths:.1}"));
+            }
+        }
+    };
+    Ok(())
+}
+
 /// Runs the segment using string input
 fn run_part_from_input<I, O>(
     mut input: Input,
@@ -287,19 +369,25 @@ where
                 start = Some(segment_run.start);
             }
             custom_output_clone.println(format!(
-                "{}{name}{}, duration: {} ms, total time elapsed: {} ms",
+                "{}{name}{}, duration: {}{}",
                 "\t".repeat(nesting as usize),
                 if no_deaths {
                     String::new()
                 } else {
                     format!(", deaths: {}", segment_run.deaths)
                 },
-                segment_run.duration().as_millis(),
-                MillisecondsSinceEpoch::duration(
-                    start.unwrap(),
-                    segment_run.end,
-                )?
-                .as_millis(),
+                format_duration(segment_run.duration()),
+                if nesting == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        ", total time elapsed: {}",
+                        format_duration(MillisecondsSinceEpoch::duration(
+                            start.unwrap(),
+                            segment_run.end,
+                        )?)
+                    )
+                },
             ));
         }
         Ok(())
@@ -356,6 +444,7 @@ where
             custom_output.println(config.list());
             Ok(())
         }
+        "stats" => stats_from_input(input, config, custom_output),
         "help" => Ok(custom_output.println(String::from(HELP_MESSAGE))),
         other => {
             return Err(Error::UnknownMode {
@@ -549,6 +638,32 @@ mod tests {
         is_error: bool,
     }
 
+    impl TestOutputMessage {
+        /// Returns the message if it is an error, panic if it is not
+        fn error(&self) -> &str {
+            &coerce_pattern!(
+                self,
+                TestOutputMessage {
+                    is_error: true,
+                    message
+                },
+                message
+            )
+        }
+
+        /// Returns the message if it is not error, panic if it is
+        fn ok(&self) -> &str {
+            &coerce_pattern!(
+                self,
+                TestOutputMessage {
+                    is_error: false,
+                    message
+                },
+                message
+            )
+        }
+    }
+
     /// Struct implementing CustomOutput to capture output
     #[derive(Clone)]
     struct TestCustomOutput {
@@ -685,92 +800,68 @@ mod tests {
         let segment = segments[0];
         assert_eq!(segment.deaths, 6);
         assert!(segment.duration() >= Duration::from_millis(159));
-        assert_eq!(
-            custom_output.next().unwrap(),
-            TestOutputMessage {
-                message: String::from("Starting!"),
-                is_error: false,
-            }
-        );
+        assert_eq!(custom_output.next().unwrap().ok(), "Starting!");
         let mut total_duration = first_a_duration;
         assert_eq!(
-            custom_output.next().unwrap(),
-            TestOutputMessage {
-                message: format!(
-                    "\tA, deaths: 2, duration: {} ms, total time elapsed: {} ms",
-                    first_a_duration.as_millis(),
-                    total_duration.as_millis(),
-                ),
-                is_error: false,
-            }
+            custom_output.next().unwrap().ok(),
+            format!(
+                "\tA, deaths: 2, duration: {}, total time elapsed: {}",
+                format_duration(first_a_duration),
+                format_duration(total_duration),
+            )
+            .as_str()
         );
         total_duration += first_b_duration;
         assert_eq!(
-            custom_output.next().unwrap(),
-            TestOutputMessage {
-                message: format!(
-                    "\tB, deaths: 1, duration: {} ms, total time elapsed: {} ms",
-                    first_b_duration.as_millis(),
-                    total_duration.as_millis()
-                ),
-                is_error: false
-            }
+            custom_output.next().unwrap().ok(),
+            format!(
+                "\tB, deaths: 1, duration: {}, total time elapsed: {}",
+                format_duration(first_b_duration),
+                format_duration(total_duration)
+            )
+            .as_str()
         );
         total_duration += second_b_duration;
         assert_eq!(
-            custom_output.next().unwrap(),
-            TestOutputMessage {
-                message: format!(
-                    "\tB, deaths: 0, duration: {} ms, total time elapsed: {} ms",
-                    second_b_duration.as_millis(),
-                    total_duration.as_millis()
-                ),
-                is_error: false
-            }
+            custom_output.next().unwrap().ok(),
+            format!(
+                "\tB, deaths: 0, duration: {}, total time elapsed: {}",
+                format_duration(second_b_duration),
+                format_duration(total_duration)
+            )
+            .as_str()
         );
         assert_eq!(
-            custom_output.next().unwrap(),
-            TestOutputMessage {
-                message: String::from(
-                    "Interpreting error as death even though line contained something other than just \"d\""
-                ),
-                is_error: true
-            }
+            custom_output.next().unwrap().error(),
+            "Interpreting error as death even though line contained something other than just \"d\""
         );
         total_duration += second_a_duration;
         assert_eq!(
-            custom_output.next().unwrap(),
-            TestOutputMessage {
-                message: format!(
-                    "\tA, deaths: 3, duration: {} ms, total time elapsed: {} ms",
-                    second_a_duration.as_millis(),
-                    total_duration.as_millis()
-                ),
-                is_error: false
-            }
+            custom_output.next().unwrap().ok(),
+            format!(
+                "\tA, deaths: 3, duration: {}, total time elapsed: {}",
+                format_duration(second_a_duration),
+                format_duration(total_duration)
+            )
+            .as_str()
         );
         total_duration += third_a_duration;
         assert_eq!(
-            custom_output.next().unwrap(),
-            TestOutputMessage {
-                message: format!(
-                    "\tA, deaths: 0, duration: {} ms, total time elapsed: {} ms",
-                    third_a_duration.as_millis(),
-                    total_duration.as_millis()
-                ),
-                is_error: false
-            }
+            custom_output.next().unwrap().ok(),
+            format!(
+                "\tA, deaths: 0, duration: {}, total time elapsed: {}",
+                format_duration(third_a_duration),
+                format_duration(total_duration)
+            )
+            .as_str()
         );
         assert_eq!(
-            custom_output.next().unwrap(),
-            TestOutputMessage {
-                message: format!(
-                    "ABBAA, deaths: 6, duration: {} ms, total time elapsed: {} ms",
-                    total_duration.as_millis(),
-                    total_duration.as_millis()
-                ),
-                is_error: false
-            }
+            custom_output.next().unwrap().ok(),
+            format!(
+                "ABBAA, deaths: 6, duration: {}",
+                format_duration(total_duration)
+            )
+            .as_str()
         );
         assert!(custom_output.next().is_none());
     }
@@ -811,23 +902,10 @@ mod tests {
         assert_eq!(segment.deaths, 2);
         let duration = segment.duration();
         assert!(duration >= Duration::from_millis(19));
+        assert_eq!(custom_output.next().unwrap().ok(), "Starting!");
         assert_eq!(
-            custom_output.next().unwrap(),
-            TestOutputMessage {
-                message: String::from("Starting!"),
-                is_error: false
-            }
-        );
-        assert_eq!(
-            custom_output.next().unwrap(),
-            TestOutputMessage {
-                message: format!(
-                    "A, duration: {} ms, total time elapsed: {} ms",
-                    duration.as_millis(),
-                    duration.as_millis(),
-                ),
-                is_error: false,
-            }
+            custom_output.next().unwrap().ok(),
+            format!("A, duration: {}", format_duration(duration),).as_str()
         );
         assert!(custom_output.next().is_none());
     }
@@ -869,13 +947,7 @@ mod tests {
     fn test_run_part_input_fail_subsequent_stdin_read() {
         let mut custom_output =
             test_run_part_from_input_error([("\n", 1)]).into_iter();
-        assert_eq!(
-            custom_output.next().unwrap(),
-            TestOutputMessage {
-                message: String::from("Starting!"),
-                is_error: false
-            }
-        );
+        assert_eq!(custom_output.next().unwrap().ok(), "Starting!");
         assert!(custom_output.next().is_none());
     }
 
@@ -1134,14 +1206,7 @@ mod tests {
             let custom_output = custom_output.consume();
             assert_eq!(custom_output.len(), 1);
             assert_eq!(
-                coerce_pattern!(
-                    &custom_output[0],
-                    TestOutputMessage {
-                        is_error: false,
-                        message
-                    },
-                    message
-                ) as &str,
+                custom_output[0].ok(),
                 "Recursive deletion of part with ID name \"a\" would result in deletion of 2 parts: [\"a\", \"ab\"]. Enter \"yes\" to confirm:"
             );
         }
@@ -1162,27 +1227,10 @@ mod tests {
             let custom_output = custom_output.consume();
             assert_eq!(custom_output.len(), 2);
             assert_eq!(
-                coerce_pattern!(
-                    &custom_output[0],
-                    TestOutputMessage {
-                        is_error: false,
-                        message
-                    },
-                    message
-                ) as &str,
+                custom_output[0].ok(),
                 "Recursive deletion of part with ID name \"a\" would result in deletion of 2 parts: [\"a\", \"ab\"]. Enter \"yes\" to confirm:"
             );
-            assert_eq!(
-                coerce_pattern!(
-                    &custom_output[1],
-                    TestOutputMessage {
-                        is_error: false,
-                        message
-                    },
-                    message
-                ) as &str,
-                "Ok! Deleting nothing."
-            );
+            assert_eq!(custom_output[1].ok(), "Ok! Deleting nothing.");
         }
         let config = Config::load(root.clone()).unwrap();
         assert_eq!(config.parts().len(), 3);
@@ -1201,25 +1249,11 @@ mod tests {
             let custom_output = custom_output.consume();
             assert_eq!(custom_output.len(), 2);
             assert_eq!(
-                coerce_pattern!(
-                    &custom_output[0],
-                    TestOutputMessage {
-                        is_error: false,
-                        message
-                    },
-                    message
-                ) as &str,
+                custom_output[0].ok(),
                 "Recursive deletion of part with ID name \"a\" would result in deletion of 2 parts: [\"a\", \"ab\"]. Enter \"yes\" to confirm:"
             );
             assert_eq!(
-                coerce_pattern!(
-                    &custom_output[1],
-                    TestOutputMessage {
-                        is_error: false,
-                        message
-                    },
-                    message
-                ) as &str,
+                custom_output[1].ok(),
                 "Ok! Deleting all 2 of these parts."
             );
         }
@@ -1317,17 +1351,7 @@ mod tests {
         .unwrap();
         let custom_output = custom_output.consume();
         assert_eq!(custom_output.len(), 1);
-        assert_eq!(
-            coerce_pattern!(
-                &custom_output[0],
-                TestOutputMessage {
-                    is_error: false,
-                    message
-                },
-                message
-            ) as &str,
-            "A"
-        );
+        assert_eq!(custom_output[0].ok(), "A");
     }
 
     /// Tests that the tree command prints the entire nested
@@ -1368,14 +1392,7 @@ mod tests {
         let custom_output = custom_output.consume();
         assert_eq!(custom_output.len(), 1);
         assert_eq!(
-            coerce_pattern!(
-                &custom_output[0],
-                TestOutputMessage {
-                    is_error: false,
-                    message
-                },
-                message
-            ) as &str,
+            custom_output[0].ok(),
             "\
 AAA\tAA\tA
    \t  \tA
@@ -1406,14 +1423,7 @@ AAA\tAA\tA
         let custom_output = custom_output.consume();
         assert_eq!(custom_output.len(), 1);
         assert_eq!(
-            coerce_pattern!(
-                &custom_output[0],
-                TestOutputMessage {
-                    is_error: false,
-                    message
-                },
-                message
-            ) as &str,
+            custom_output[0].ok(),
             "\
 a: B\tSegment
 b: C\tGroup
@@ -1435,16 +1445,151 @@ c: A\tSegment"
             .unwrap();
         let custom_output = custom_output.consume();
         assert_eq!(custom_output.len(), 1);
-        assert_eq!(
-            coerce_pattern!(
-                &custom_output[0],
-                TestOutputMessage {
-                    is_error: false,
-                    message
-                },
-                message
-            ) as &str,
-            HELP_MESSAGE
-        );
+        assert_eq!(custom_output[0].ok(), HELP_MESSAGE);
+    }
+
+    /// Tests the four main outputs from the stats subcommand:
+    /// 1. if ID name is unknown, Error::IdNameNotFound is returned
+    /// 2. if ID name is known but no runs are saved,
+    ///    user is told this in a single simple message
+    /// 3. if ID name is known and runs are saved and --include-deaths
+    ///    is passed, all stats are printed
+    /// 4. if ID name is known and runs are saved but --include-deaths
+    ///    is not passed, all duration stats are printed (but not deaths)
+    #[test]
+    fn test_stats_from_input() {
+        let root = temp_dir().join("test_stats_from_input");
+        let mut config = Config::new(root.clone());
+        config.add_segment(Arc::from("a"), Arc::from("A")).unwrap();
+        config.add_segment(Arc::from("b"), Arc::from("B")).unwrap();
+        let config = config;
+        config.save().unwrap();
+        let _temp_file = TempFile {
+            path: root.join("a.csv"),
+        };
+        SegmentRun {
+            deaths: 5,
+            start: MillisecondsSinceEpoch(0),
+            end: MillisecondsSinceEpoch(10000),
+        }
+        .save(&root.join("a.csv"))
+        .unwrap();
+        {
+            let input = Input::collect(
+                ["<>", "stats", "--id-name", "a", "--include-deaths"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap();
+            let custom_input = TestCustomInput::empty();
+            let custom_output = TestCustomOutput::new();
+            run_application_base(input, config, custom_input, &custom_output)
+                .unwrap();
+            let mut custom_output = custom_output.consume().into_iter();
+            assert_eq!(custom_output.next().unwrap().ok(), "# of runs: 1");
+            assert_eq!(
+                custom_output.next().unwrap().ok(),
+                "Best duration: 10.000 s"
+            );
+            assert_eq!(
+                custom_output.next().unwrap().ok(),
+                "Worst duration: 10.000 s"
+            );
+            assert_eq!(
+                custom_output.next().unwrap().ok(),
+                "Mean duration: 10.000 s"
+            );
+            assert_eq!(
+                custom_output.next().unwrap().ok(),
+                "Median duration: 10.000 s"
+            );
+            assert_eq!(custom_output.next().unwrap().ok(), "Best deaths: 5");
+            assert_eq!(custom_output.next().unwrap().ok(), "Worst deaths: 5");
+            assert_eq!(
+                custom_output.next().unwrap().ok(),
+                "Mean deaths: 5.000"
+            );
+            assert_eq!(
+                custom_output.next().unwrap().ok(),
+                "Median deaths: 5.0"
+            );
+            assert!(custom_output.next().is_none());
+        }
+        let config = Config::load(root.clone()).unwrap();
+        {
+            let input = Input::collect(
+                ["<>", "stats", "--id-name", "a"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap();
+            let custom_input = TestCustomInput::empty();
+            let custom_output = TestCustomOutput::new();
+            run_application_base(input, config, custom_input, &custom_output)
+                .unwrap();
+            let mut custom_output = custom_output.consume().into_iter();
+            assert_eq!(custom_output.next().unwrap().ok(), "# of runs: 1");
+            assert_eq!(
+                custom_output.next().unwrap().ok(),
+                "Best duration: 10.000 s"
+            );
+            assert_eq!(
+                custom_output.next().unwrap().ok(),
+                "Worst duration: 10.000 s"
+            );
+            assert_eq!(
+                custom_output.next().unwrap().ok(),
+                "Mean duration: 10.000 s"
+            );
+            assert_eq!(
+                custom_output.next().unwrap().ok(),
+                "Median duration: 10.000 s"
+            );
+            assert!(custom_output.next().is_none());
+        }
+        let config = Config::load(root.clone()).unwrap();
+        {
+            let input = Input::collect(
+                ["<>", "stats", "--id-name", "c"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap();
+            let custom_input = TestCustomInput::empty();
+            let custom_output = TestCustomOutput::new();
+            assert_eq!(
+                &coerce_pattern!(
+                    run_application_base(
+                        input,
+                        config,
+                        custom_input,
+                        &custom_output
+                    ),
+                    Err(Error::IdNameNotFound { id_name }),
+                    id_name
+                ) as &str,
+                "c"
+            );
+            assert!(custom_output.consume().is_empty());
+        }
+        let config = Config::load(root.clone()).unwrap();
+        {
+            let input = Input::collect(
+                ["<>", "stats", "--id-name", "b"]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap();
+            let custom_input = TestCustomInput::empty();
+            let custom_output = TestCustomOutput::new();
+            run_application_base(input, config, custom_input, &custom_output)
+                .unwrap();
+            let custom_output = custom_output.consume();
+            assert_eq!(custom_output.len(), 1);
+            assert_eq!(
+                custom_output[0].ok(),
+                "Segment with ID name \"b\" has no runs yet."
+            );
+        }
     }
 }

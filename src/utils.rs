@@ -201,7 +201,7 @@ mod tests {
     /// 1. no elements are yielded
     /// 2. the source iterators are each advanced one element
     #[test]
-    fn zip_samenone_in_common() {
+    fn zip_same_none_in_common() {
         let mut x_yielded: Vec<i32> = Vec::new();
         let mut y_yielded: Vec<i32> = Vec::new();
         let x = [1, 2, 3, 4].into_iter().map(|value| {

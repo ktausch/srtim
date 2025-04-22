@@ -2,6 +2,7 @@
 //! 1. owning-types defining segments and segment groups
 //! 2. non-owning-type defining a part of a run in a tree like structure
 use std::collections::{HashMap, hash_map::Entry};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -9,7 +10,9 @@ use std::thread;
 
 use crate::coerce_pattern;
 use crate::error::{Error, Result};
-use crate::segment_run::{SegmentRun, SegmentRunEvent, SupplementedSegmentRun};
+use crate::segment_run::{
+    SegmentRun, SegmentRunEvent, SegmentStats, SupplementedSegmentRun,
+};
 use crate::utils::zip_same;
 
 /// Ensures that display_name doesn't have a tab,
@@ -412,6 +415,21 @@ impl<'a> RunPart<'a> {
         match tagging_thread.join() {
             Ok(result) => result,
             Err(_) => Err(Error::SegmentTaggingThreadPanicked),
+        }
+    }
+
+    /// Gets the stats of the full run part
+    pub fn get_stats(&self) -> Result<Option<SegmentStats>> {
+        match SegmentRun::load_all(self.file_name()) {
+            Ok(runs) => Ok(SegmentStats::from_runs(&runs)),
+            Err(Error::CouldNotReadSegmentRunFile { path, error }) => {
+                if error.kind() == ErrorKind::NotFound {
+                    Ok(None)
+                } else {
+                    Err(Error::CouldNotReadSegmentRunFile { path, error })
+                }
+            }
+            Err(error) => Err(error),
         }
     }
 }
