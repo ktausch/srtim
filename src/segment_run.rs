@@ -186,27 +186,51 @@ impl Display for SegmentRunEvent {
 }
 
 #[derive(Clone, Copy)]
-/// Information about a single segment run
-pub struct SegmentRun {
-    /// the number of deaths in the run
-    pub deaths: u32,
-    /// the instant the run started
+pub struct Interval {
+    /// the first instant in the interval
     pub start: MillisecondsSinceEpoch,
-    /// the instant the run ended
+    /// the last instant in the interval
     pub end: MillisecondsSinceEpoch,
 }
 
+impl Interval {
+    /// The amount of time an interval represents as a Duration object
+    pub fn duration(&self) -> Duration {
+        Duration::from_millis((self.end.0 - self.start.0).try_into().expect(
+            "The program cannot handle durations of 2^64 or more milliseconds",
+        ))
+    }
+
+    /// True if this interval completely envelopes the other interval
+    pub fn contains(&self, other: &Self) -> bool {
+        (self.start.0 <= other.start.0) && (self.end.0 >= other.end.0)
+    }
+}
+
+/// Information about a single segment run
+#[derive(Clone, Copy)]
+pub struct SegmentRun {
+    /// the number of deaths in the run
+    pub deaths: u32,
+    /// the time at which the run occurred
+    pub interval: Interval,
+}
+
 impl SegmentRun {
+    /// Adds the given run to this one. If next.interval.start does not
+    /// match self.interval.end, a SegmentCombinationError is returned
     pub fn accumulate(&mut self, next: &Self) -> Result<()> {
-        if self.end.0 == next.start.0 {
+        if self.interval.end.0 == next.interval.start.0 {
             self.deaths += next.deaths;
-            self.end = next.end;
+            self.interval.end = next.interval.end;
             Ok(())
         } else {
             Err(Error::SegmentCombinationError)
         }
     }
 
+    /// Returns a new SegmentRun equal to next if maybe_started is None.
+    /// Accumulates next onto the SegmentRun if maybe_started is Some.
     pub fn accumulate_or_start(
         maybe_started: Option<Self>,
         next: &Self,
@@ -241,14 +265,15 @@ impl SegmentRun {
             };
         }
         let end = MillisecondsSinceEpoch::now();
-        Ok(SegmentRun { deaths, start, end })
+        Ok(SegmentRun {
+            deaths,
+            interval: Interval { start, end },
+        })
     }
 
     /// The amount of time a run took as a Duration object
     pub fn duration(&self) -> Duration {
-        Duration::from_millis((self.end.0 - self.start.0).try_into().expect(
-            "The program cannot handle durations of 2^64 or more milliseconds",
-        ))
+        self.interval.duration()
     }
 
     /// Runs the given number of segments in a row, starting inside this function.
@@ -263,7 +288,7 @@ impl SegmentRun {
         for index in 1..(num_segments + 1) {
             match SegmentRun::run(&segment_run_event_receiver, start) {
                 Ok(segment_run) => {
-                    start = segment_run.end;
+                    start = segment_run.interval.end;
                     if let Err(_) = segment_run_sender.send(segment_run) {
                         return Err(Error::FailedToSendSegment { index });
                     }
@@ -307,8 +332,11 @@ impl SegmentRun {
                 }
             }?;
         file.write(
-            format!("{},{},{}\n", self.start.0, self.end.0, self.deaths)
-                .as_bytes(),
+            format!(
+                "{},{},{}\n",
+                self.interval.start.0, self.interval.end.0, self.deaths
+            )
+            .as_bytes(),
         )
         .map_err(io_error_map)?;
         Ok(())
@@ -351,7 +379,10 @@ impl SegmentRun {
             let deaths: u32 = tokens[2].parse().map_err(|_| {
                 Error::SegmentRunFileLineParseError { index, column: 2 }
             })?;
-            result.push(SegmentRun { start, end, deaths });
+            result.push(SegmentRun {
+                interval: Interval { start, end },
+                deaths,
+            });
         }
         Ok(result.into())
     }
@@ -392,18 +423,21 @@ pub struct SegmentStats {
 impl SegmentStats {
     /// Computes the min, max, mean, and median of the duration
     /// and death count of all runs in the slice.
-    pub fn from_runs(runs: &[SegmentRun]) -> Option<SegmentStats> {
-        let num_runs = runs.len();
-        let mut runs = (&runs as &[SegmentRun]).into_iter();
+    pub fn from_runs<'a>(
+        runs: impl IntoIterator<Item = &'a SegmentRun>,
+    ) -> Option<SegmentStats> {
+        let mut runs = runs.into_iter();
         let run = runs.next()?;
         let duration = run.duration();
         let mut sum_deaths = run.deaths;
         let mut sum_duration = duration.as_millis();
-        let mut durations = Vec::with_capacity(num_runs);
-        let mut deaths = Vec::with_capacity(num_runs);
+        let mut durations = Vec::new();
+        let mut deaths = Vec::new();
+        let mut num_runs = 1;
         durations.push(sum_duration);
         deaths.push(sum_deaths);
         while let Some(run) = runs.next() {
+            num_runs += 1;
             let milliseconds = run.duration().as_millis();
             sum_duration += milliseconds;
             sum_deaths += run.deaths;
@@ -511,19 +545,23 @@ mod tests {
     fn combine_segment_runs() {
         let mut accumulator = SegmentRun {
             deaths: 1,
-            start: MillisecondsSinceEpoch(0),
-            end: MillisecondsSinceEpoch(10),
+            interval: Interval {
+                start: MillisecondsSinceEpoch(0),
+                end: MillisecondsSinceEpoch(10),
+            },
         };
         let new = SegmentRun {
             deaths: 2,
-            start: MillisecondsSinceEpoch(10),
-            end: MillisecondsSinceEpoch(30),
+            interval: Interval {
+                start: MillisecondsSinceEpoch(10),
+                end: MillisecondsSinceEpoch(30),
+            },
         };
 
         accumulator.accumulate(&new).unwrap();
         assert_eq!(accumulator.deaths, 3);
-        assert_eq!(accumulator.start.0, 0);
-        assert_eq!(accumulator.end.0, 30);
+        assert_eq!(accumulator.interval.start.0, 0);
+        assert_eq!(accumulator.interval.end.0, 30);
         assert_eq!(accumulator.duration(), Duration::from_millis(30));
     }
 
@@ -532,8 +570,10 @@ mod tests {
     fn combine_segment_runs_no_shared_endpoint() {
         let mut existing = SegmentRun {
             deaths: 1,
-            start: MillisecondsSinceEpoch(0),
-            end: MillisecondsSinceEpoch(10),
+            interval: Interval {
+                start: MillisecondsSinceEpoch(0),
+                end: MillisecondsSinceEpoch(10),
+            },
         };
         let clone = existing.clone();
         assert_pattern!(
@@ -547,8 +587,10 @@ mod tests {
     fn duration_of_segment_run() {
         let segment_run = SegmentRun {
             deaths: 0,
-            start: MillisecondsSinceEpoch(0),
-            end: MillisecondsSinceEpoch(500_000),
+            interval: Interval {
+                start: MillisecondsSinceEpoch(0),
+                end: MillisecondsSinceEpoch(500_000),
+            },
         };
         let duration = segment_run.duration();
         let expected_duration = Duration::from_secs(500);
@@ -747,8 +789,10 @@ mod tests {
         drop(TempFile { path: path.clone() });
         let first = SegmentRun {
             deaths: 3,
-            start: MillisecondsSinceEpoch(1000),
-            end: MillisecondsSinceEpoch(91000),
+            interval: Interval {
+                start: MillisecondsSinceEpoch(1000),
+                end: MillisecondsSinceEpoch(91000),
+            },
         };
         first.save(&path).unwrap();
         assert_eq!(
@@ -757,8 +801,10 @@ mod tests {
         );
         let second = SegmentRun {
             deaths: 1,
-            start: MillisecondsSinceEpoch(100000),
-            end: MillisecondsSinceEpoch(200000),
+            interval: Interval {
+                start: MillisecondsSinceEpoch(100000),
+                end: MillisecondsSinceEpoch(200000),
+            },
         };
         second.save(&path).unwrap();
         assert_eq!(
@@ -871,21 +917,23 @@ mod tests {
     /// returns None if there are no runs.
     #[test]
     fn test_stats_zero_runs() {
-        let runs = Arc::from([]);
-        assert!(SegmentStats::from_runs(&runs).is_none());
+        let runs: Arc<[SegmentRun]> = Arc::from([]);
+        assert!(SegmentStats::from_runs(runs.into_iter()).is_none());
     }
 
     /// Tests that the SegmentStats::from_runs method has the best, worst,
     /// mean, and median equal to the single run if there is only one.
     #[test]
     fn test_stats_single_run() {
-        let runs = Arc::from([SegmentRun {
+        let runs: Arc<[SegmentRun]> = Arc::new([SegmentRun {
             deaths: 7,
-            start: MillisecondsSinceEpoch(0),
-            end: MillisecondsSinceEpoch(3624000),
+            interval: Interval {
+                start: MillisecondsSinceEpoch(0),
+                end: MillisecondsSinceEpoch(3624000),
+            },
         }]);
         let duration = Duration::from_secs(3624);
-        let stats = SegmentStats::from_runs(&runs).unwrap();
+        let stats = SegmentStats::from_runs(runs.into_iter()).unwrap();
         assert_eq!(stats.num_runs, 1);
         assert_eq!(duration, stats.durations.best);
         assert_eq!(duration, stats.durations.worst);
@@ -901,19 +949,23 @@ mod tests {
     /// mean, and median equal to the expected values when there are two runs.
     #[test]
     fn test_stats_two_runs() {
-        let runs = Arc::from([
+        let runs: Arc<[SegmentRun]> = Arc::from([
             SegmentRun {
                 deaths: 7,
-                start: MillisecondsSinceEpoch(0),
-                end: MillisecondsSinceEpoch(3624000),
+                interval: Interval {
+                    start: MillisecondsSinceEpoch(0),
+                    end: MillisecondsSinceEpoch(3624000),
+                },
             },
             SegmentRun {
                 deaths: 6,
-                start: MillisecondsSinceEpoch(0),
-                end: MillisecondsSinceEpoch(3600000),
+                interval: Interval {
+                    start: MillisecondsSinceEpoch(0),
+                    end: MillisecondsSinceEpoch(3600000),
+                },
             },
         ]);
-        let stats = SegmentStats::from_runs(&runs).unwrap();
+        let stats = SegmentStats::from_runs(runs.into_iter()).unwrap();
         assert_eq!(stats.num_runs, 2);
         assert_eq!(Duration::from_secs(3600), stats.durations.best);
         assert_eq!(Duration::from_secs(3624), stats.durations.worst);
@@ -930,24 +982,30 @@ mod tests {
     /// the expected values when there are three runs.
     #[test]
     fn test_stats_three_runs() {
-        let runs = Arc::from([
+        let runs: Arc<[SegmentRun]> = Arc::from([
             SegmentRun {
                 deaths: 1,
-                start: MillisecondsSinceEpoch(0),
-                end: MillisecondsSinceEpoch(20000),
+                interval: Interval {
+                    start: MillisecondsSinceEpoch(0),
+                    end: MillisecondsSinceEpoch(20000),
+                },
             },
             SegmentRun {
                 deaths: 2,
-                start: MillisecondsSinceEpoch(0),
-                end: MillisecondsSinceEpoch(30000),
+                interval: Interval {
+                    start: MillisecondsSinceEpoch(0),
+                    end: MillisecondsSinceEpoch(30000),
+                },
             },
             SegmentRun {
                 deaths: 6,
-                start: MillisecondsSinceEpoch(0),
-                end: MillisecondsSinceEpoch(100000),
+                interval: Interval {
+                    start: MillisecondsSinceEpoch(0),
+                    end: MillisecondsSinceEpoch(100000),
+                },
             },
         ]);
-        let stats = SegmentStats::from_runs(&runs).unwrap();
+        let stats = SegmentStats::from_runs(runs.into_iter()).unwrap();
         assert_eq!(stats.num_runs, 3);
         assert_eq!(Duration::from_secs(20), stats.durations.best);
         assert_eq!(Duration::from_secs(100), stats.durations.worst);

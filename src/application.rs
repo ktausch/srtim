@@ -248,7 +248,8 @@ where
 {
     let id_name = input.extract_option_single_value("--id-name")?;
     let include_deaths = input.extract_option_no_values("--include-deaths")?;
-    match config.get_stats(&id_name)? {
+    let during = input.extract_option_single_value("--during").ok();
+    match config.get_stats(&id_name, during.as_ref().map(|d| d as &str))? {
         None => {
             custom_output.println(format!(
                 "Segment with ID name \"{id_name}\" has no runs yet."
@@ -366,7 +367,7 @@ where
         }) = supplemented_segment_run_receiver.recv()
         {
             if let None = start {
-                start = Some(segment_run.start);
+                start = Some(segment_run.interval.start);
             }
             custom_output_clone.println(format!(
                 "{}{name}{}, duration: {}{}",
@@ -384,7 +385,7 @@ where
                         ", total time elapsed: {}",
                         format_duration(MillisecondsSinceEpoch::duration(
                             start.unwrap(),
-                            segment_run.end,
+                            segment_run.interval.end,
                         )?)
                     )
                 },
@@ -470,7 +471,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::error::Error;
-    use crate::segment_run::SegmentRun;
+    use crate::segment_run::{Interval, SegmentRun};
     use crate::utils::TempFile;
     use crate::{assert_pattern, coerce_pattern};
 
@@ -1462,6 +1463,7 @@ c: A\tSegment"
         let mut config = Config::new(root.clone());
         config.add_segment(Arc::from("a"), Arc::from("A")).unwrap();
         config.add_segment(Arc::from("b"), Arc::from("B")).unwrap();
+        config.add_segment(Arc::from("d"), Arc::from("D")).unwrap();
         let config = config;
         config.save().unwrap();
         let _temp_file = TempFile {
@@ -1469,10 +1471,30 @@ c: A\tSegment"
         };
         SegmentRun {
             deaths: 5,
-            start: MillisecondsSinceEpoch(0),
-            end: MillisecondsSinceEpoch(10000),
+            interval: Interval {
+                start: MillisecondsSinceEpoch(0),
+                end: MillisecondsSinceEpoch(10000),
+            },
         }
         .save(&root.join("a.csv"))
+        .unwrap();
+        SegmentRun {
+            deaths: 3,
+            interval: Interval {
+                start: MillisecondsSinceEpoch(20000),
+                end: MillisecondsSinceEpoch(25000),
+            },
+        }
+        .save(&root.join("a.csv"))
+        .unwrap();
+        SegmentRun {
+            deaths: 4,
+            interval: Interval {
+                start: MillisecondsSinceEpoch(20000),
+                end: MillisecondsSinceEpoch(30000),
+            },
+        }
+        .save(&root.join("d.csv"))
         .unwrap();
         {
             let input = Input::collect(
@@ -1486,10 +1508,10 @@ c: A\tSegment"
             run_application_base(input, config, custom_input, &custom_output)
                 .unwrap();
             let mut custom_output = custom_output.consume().into_iter();
-            assert_eq!(custom_output.next().unwrap().ok(), "# of runs: 1");
+            assert_eq!(custom_output.next().unwrap().ok(), "# of runs: 2");
             assert_eq!(
                 custom_output.next().unwrap().ok(),
-                "Best duration: 10.000 s"
+                "Best duration: 5.000 s"
             );
             assert_eq!(
                 custom_output.next().unwrap().ok(),
@@ -1497,28 +1519,28 @@ c: A\tSegment"
             );
             assert_eq!(
                 custom_output.next().unwrap().ok(),
-                "Mean duration: 10.000 s"
+                "Mean duration: 7.500 s"
             );
             assert_eq!(
                 custom_output.next().unwrap().ok(),
-                "Median duration: 10.000 s"
+                "Median duration: 7.500 s"
             );
-            assert_eq!(custom_output.next().unwrap().ok(), "Best deaths: 5");
+            assert_eq!(custom_output.next().unwrap().ok(), "Best deaths: 3");
             assert_eq!(custom_output.next().unwrap().ok(), "Worst deaths: 5");
             assert_eq!(
                 custom_output.next().unwrap().ok(),
-                "Mean deaths: 5.000"
+                "Mean deaths: 4.000"
             );
             assert_eq!(
                 custom_output.next().unwrap().ok(),
-                "Median deaths: 5.0"
+                "Median deaths: 4.0"
             );
             assert!(custom_output.next().is_none());
         }
         let config = Config::load(root.clone()).unwrap();
         {
             let input = Input::collect(
-                ["<>", "stats", "--id-name", "a"]
+                ["<>", "stats", "--id-name", "a", "--during", "d"]
                     .into_iter()
                     .map(String::from),
             )
@@ -1531,19 +1553,19 @@ c: A\tSegment"
             assert_eq!(custom_output.next().unwrap().ok(), "# of runs: 1");
             assert_eq!(
                 custom_output.next().unwrap().ok(),
-                "Best duration: 10.000 s"
+                "Best duration: 5.000 s"
             );
             assert_eq!(
                 custom_output.next().unwrap().ok(),
-                "Worst duration: 10.000 s"
+                "Worst duration: 5.000 s"
             );
             assert_eq!(
                 custom_output.next().unwrap().ok(),
-                "Mean duration: 10.000 s"
+                "Mean duration: 5.000 s"
             );
             assert_eq!(
                 custom_output.next().unwrap().ok(),
-                "Median duration: 10.000 s"
+                "Median duration: 5.000 s"
             );
             assert!(custom_output.next().is_none());
         }
