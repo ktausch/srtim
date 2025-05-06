@@ -10,9 +10,7 @@ use std::thread;
 
 use crate::coerce_pattern;
 use crate::error::{Error, Result};
-use crate::segment_run::{
-    SegmentRun, SegmentRunEvent, SegmentStats, SupplementedSegmentRun,
-};
+use crate::segment_run::{SegmentRun, SegmentRunEvent, SupplementedSegmentRun};
 use crate::utils::zip_same;
 
 /// Ensures that display_name doesn't have a tab,
@@ -418,13 +416,13 @@ impl<'a> RunPart<'a> {
         }
     }
 
-    /// Gets the stats of the full run part
-    pub fn get_stats(&self) -> Result<Option<SegmentStats>> {
+    /// Gets all runs of the given run part
+    pub fn get_runs(&self) -> Result<Arc<[SegmentRun]>> {
         match SegmentRun::load_all(self.file_name()) {
-            Ok(runs) => Ok(SegmentStats::from_runs(&runs)),
+            Ok(runs) => Ok(runs),
             Err(Error::CouldNotReadSegmentRunFile { path, error }) => {
                 if error.kind() == ErrorKind::NotFound {
-                    Ok(None)
+                    Ok(Arc::new([]))
                 } else {
                     Err(Error::CouldNotReadSegmentRunFile { path, error })
                 }

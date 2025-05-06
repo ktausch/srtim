@@ -715,8 +715,23 @@ impl Config {
     }
 
     /// Gets the best, worst, mean, and median duration and death of given part
-    pub fn get_stats(&self, id_name: &str) -> Result<Option<SegmentStats>> {
-        self.use_run_info(id_name, |run_part| run_part.get_stats())?
+    pub fn get_stats<'a>(
+        &self,
+        id_name: &'a str,
+        during: Option<&'a str>,
+    ) -> Result<Option<SegmentStats>> {
+        let runs =
+            self.use_run_info(id_name, |run_part| run_part.get_runs())??;
+        match during {
+            Some(during) => {
+                let during =
+                    self.use_run_info(during, |run_part| run_part.get_runs())??;
+                Ok(SegmentStats::from_runs(runs.into_iter().filter(|run| {
+                    during.iter().any(|d| d.interval.contains(&run.interval))
+                })))
+            }
+            None => Ok(SegmentStats::from_runs(runs.into_iter())),
+        }
     }
 }
 
@@ -730,7 +745,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::assert_pattern;
-    use crate::segment_run::{MillisecondsSinceEpoch, SegmentRun};
+    use crate::segment_run::{Interval, MillisecondsSinceEpoch, SegmentRun};
     use crate::utils::TempFile;
 
     /// Makes a config containing
@@ -1779,21 +1794,23 @@ g: G\tSegment"
         config.save().unwrap();
         assert_eq!(
             &coerce_pattern!(
-                config.get_stats("z"),
+                config.get_stats("z", None),
                 Err(Error::IdNameNotFound { id_name }),
                 id_name
             ) as &str,
             "z"
         );
-        assert!(config.get_stats("b").unwrap().is_none());
+        assert!(config.get_stats("b", None).unwrap().is_none());
         SegmentRun {
             deaths: 0,
-            start: MillisecondsSinceEpoch(0),
-            end: MillisecondsSinceEpoch(10000),
+            interval: Interval {
+                start: MillisecondsSinceEpoch(0),
+                end: MillisecondsSinceEpoch(10000),
+            },
         }
         .save(&config.root.join("a.csv"))
         .unwrap();
-        let stats = config.get_stats("a").unwrap().unwrap();
+        let stats = config.get_stats("a", None).unwrap().unwrap();
         assert_eq!(Duration::from_secs(10), stats.durations.best);
         assert_eq!(Duration::from_secs(10), stats.durations.worst);
         assert_eq!(Duration::from_secs(10), stats.durations.mean);
