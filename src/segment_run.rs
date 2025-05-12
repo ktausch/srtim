@@ -176,6 +176,8 @@ pub enum SegmentRunEvent {
     Death,
     /// end of a segment
     End,
+    /// cancel the entire run
+    Cancel,
 }
 
 impl Display for SegmentRunEvent {
@@ -214,6 +216,8 @@ pub struct SegmentRun {
     pub deaths: u32,
     /// the time at which the run occurred
     pub interval: Interval,
+    /// true if this run was canceled before it was completed
+    pub canceled: bool,
 }
 
 impl SegmentRun {
@@ -223,6 +227,7 @@ impl SegmentRun {
         if self.interval.end.0 == next.interval.start.0 {
             self.deaths += next.deaths;
             self.interval.end = next.interval.end;
+            self.canceled = self.canceled || next.canceled;
             Ok(())
         } else {
             Err(Error::SegmentCombinationError)
@@ -251,6 +256,7 @@ impl SegmentRun {
         start: MillisecondsSinceEpoch,
     ) -> Result<SegmentRun> {
         let mut deaths: u32 = 0u32;
+        let mut canceled = false;
         loop {
             match receiver.recv() {
                 Ok(SegmentRunEvent::End) => {
@@ -258,6 +264,10 @@ impl SegmentRun {
                 }
                 Ok(SegmentRunEvent::Death) => {
                     deaths += 1;
+                }
+                Ok(SegmentRunEvent::Cancel) => {
+                    canceled = true;
+                    break;
                 }
                 Err(_) => {
                     return Err(Error::ChannelClosedBeforeEnd);
@@ -268,6 +278,7 @@ impl SegmentRun {
         Ok(SegmentRun {
             deaths,
             interval: Interval { start, end },
+            canceled,
         })
     }
 
@@ -289,8 +300,16 @@ impl SegmentRun {
             match SegmentRun::run(&segment_run_event_receiver, start) {
                 Ok(segment_run) => {
                     start = segment_run.interval.end;
-                    if let Err(_) = segment_run_sender.send(segment_run) {
-                        return Err(Error::FailedToSendSegment { index });
+                    let canceled = segment_run.canceled;
+                    match segment_run_sender.send(segment_run) {
+                        Ok(()) => {
+                            if canceled {
+                                return Ok(());
+                            }
+                        }
+                        Err(_) => {
+                            return Err(Error::FailedToSendSegment { index });
+                        }
                     }
                 }
                 Err(error) => {
@@ -316,7 +335,8 @@ impl SegmentRun {
         let mut file =
             match File::options().write(true).create_new(true).open(&path) {
                 Ok(mut file) => {
-                    file.write(b"start,end,deaths\n").map_err(io_error_map)?;
+                    file.write(b"start,end,deaths,canceled\n")
+                        .map_err(io_error_map)?;
                     Ok(file)
                 }
                 Err(error) => {
@@ -333,8 +353,11 @@ impl SegmentRun {
             }?;
         file.write(
             format!(
-                "{},{},{}\n",
-                self.interval.start.0, self.interval.end.0, self.deaths
+                "{},{},{},{}\n",
+                self.interval.start.0,
+                self.interval.end.0,
+                self.deaths,
+                if self.canceled { '1' } else { '0' }
             )
             .as_bytes(),
         )
@@ -343,7 +366,10 @@ impl SegmentRun {
     }
 
     /// Loads all SegmentRun objects stored in a csv file.
-    pub fn load_all(path: &Path) -> Result<Arc<[SegmentRun]>> {
+    pub fn load_all(
+        path: &Path,
+        include_canceled: bool,
+    ) -> Result<Arc<[SegmentRun]>> {
         let contents = fs::read_to_string(path).map_err(|error| {
             Error::CouldNotReadSegmentRunFile {
                 path: path.to_path_buf(),
@@ -357,7 +383,7 @@ impl SegmentRun {
             .enumerate();
         lines.next();
         let mut result: Vec<SegmentRun> = Vec::new();
-        let expected_number_of_elements = 3 as usize;
+        let expected_number_of_elements = 4 as usize;
         for (index, line) in lines {
             let tokens =
                 load_n_tokens(line.split(','), expected_number_of_elements)
@@ -368,6 +394,13 @@ impl SegmentRun {
                             expected_number_of_elements,
                         }
                     })?;
+            let canceled = tokens[3].parse::<u8>().map_err(|_| {
+                Error::SegmentRunFileLineParseError { index, column: 3 }
+            })?;
+            let canceled = canceled != 0;
+            if canceled && !include_canceled {
+                continue;
+            }
             let start =
                 MillisecondsSinceEpoch(tokens[0].parse().map_err(|_| {
                     Error::SegmentRunFileLineParseError { index, column: 0 }
@@ -382,6 +415,7 @@ impl SegmentRun {
             result.push(SegmentRun {
                 interval: Interval { start, end },
                 deaths,
+                canceled,
             });
         }
         Ok(result.into())
@@ -549,6 +583,7 @@ mod tests {
                 start: MillisecondsSinceEpoch(0),
                 end: MillisecondsSinceEpoch(10),
             },
+            canceled: false,
         };
         let new = SegmentRun {
             deaths: 2,
@@ -556,6 +591,7 @@ mod tests {
                 start: MillisecondsSinceEpoch(10),
                 end: MillisecondsSinceEpoch(30),
             },
+            canceled: false,
         };
 
         accumulator.accumulate(&new).unwrap();
@@ -574,6 +610,7 @@ mod tests {
                 start: MillisecondsSinceEpoch(0),
                 end: MillisecondsSinceEpoch(10),
             },
+            canceled: false,
         };
         let clone = existing.clone();
         assert_pattern!(
@@ -591,6 +628,7 @@ mod tests {
                 start: MillisecondsSinceEpoch(0),
                 end: MillisecondsSinceEpoch(500_000),
             },
+            canceled: false,
         };
         let duration = segment_run.duration();
         let expected_duration = Duration::from_secs(500);
@@ -676,15 +714,15 @@ mod tests {
     fn load_all_segment_runs_not_enough_commas() {
         let temp_file = TempFile::with_contents(
             temp_dir().join("load_all_segment_runs_not_enough_commas.csv"),
-            "start,end,deaths\n0,10\n",
+            "start,end,deaths,canceled\n0,10,0\n",
         )
         .unwrap();
         assert_pattern!(
-            SegmentRun::load_all(&temp_file.path),
+            SegmentRun::load_all(&temp_file.path, true),
             Err(Error::InvalidSegmentRunFileLine {
                 index: 1,
                 too_many_separators: false,
-                expected_number_of_elements: 3
+                expected_number_of_elements: 4
             })
         );
     }
@@ -694,15 +732,15 @@ mod tests {
     fn load_all_segment_runs_too_many_commas() {
         let temp_file = TempFile::with_contents(
             temp_dir().join("load_all_segment_runs_too_many_commas.csv"),
-            "start,end,deaths\n0,10,10,\n",
+            "start,end,deaths,canceled\n0,10,10,0,\n",
         )
         .unwrap();
         assert_pattern!(
-            SegmentRun::load_all(&temp_file.path),
+            SegmentRun::load_all(&temp_file.path, true),
             Err(Error::InvalidSegmentRunFileLine {
                 index: 1,
                 too_many_separators: true,
-                expected_number_of_elements: 3
+                expected_number_of_elements: 4
             })
         );
     }
@@ -713,11 +751,11 @@ mod tests {
     fn load_all_segment_runs_unparsable() {
         let temp_file = TempFile::with_contents(
             temp_dir().join("load_all_segment_runs_unparsable_0.csv"),
-            "start,end,deaths\n0,10,0\n15.,20,1\n",
+            "start,end,deaths,canceled\n0,10,0,0\n15.,20,1,0\n",
         )
         .unwrap();
         assert_pattern!(
-            SegmentRun::load_all(&temp_file.path),
+            SegmentRun::load_all(&temp_file.path, true),
             Err(Error::SegmentRunFileLineParseError {
                 index: 2,
                 column: 0
@@ -725,11 +763,11 @@ mod tests {
         );
         let temp_file = TempFile::with_contents(
             temp_dir().join("load_all_segment_runs_unparsable_1.csv"),
-            "start,end,deaths\n0,1h,0\n",
+            "start,end,deaths,canceled\n0,1h,0,0\n",
         )
         .unwrap();
         assert_pattern!(
-            SegmentRun::load_all(&temp_file.path),
+            SegmentRun::load_all(&temp_file.path, true),
             Err(Error::SegmentRunFileLineParseError {
                 index: 1,
                 column: 1
@@ -737,14 +775,26 @@ mod tests {
         );
         let temp_file = TempFile::with_contents(
             temp_dir().join("load_all_segment_runs_unparsable_2.csv"),
-            "start,end,deaths\n0,10,0.\n",
+            "start,end,deaths,canceled\n0,10,0.,1\n",
         )
         .unwrap();
         assert_pattern!(
-            SegmentRun::load_all(&temp_file.path),
+            SegmentRun::load_all(&temp_file.path, true),
             Err(Error::SegmentRunFileLineParseError {
                 index: 1,
                 column: 2
+            })
+        );
+        let temp_file = TempFile::with_contents(
+            temp_dir().join("load_all_segment_runs_unparsable_3.csv"),
+            "start,end,deaths,canceled\n0,10,0,yes\n",
+        )
+        .unwrap();
+        assert_pattern!(
+            SegmentRun::load_all(&temp_file.path, true),
+            Err(Error::SegmentRunFileLineParseError {
+                index: 1,
+                column: 3
             })
         );
     }
@@ -756,7 +806,7 @@ mod tests {
         let temp =
             temp_dir().join("load_all_segment_runs_nonexistent_file.csv");
         let (path, error) = coerce_pattern!(
-            SegmentRun::load_all(&temp),
+            SegmentRun::load_all(&temp, true),
             Err(Error::CouldNotReadSegmentRunFile { path, error }),
             (path, error)
         );
@@ -769,17 +819,26 @@ mod tests {
     fn load_all_segment_runs_happy_path() {
         let temp_file = TempFile::with_contents(
             temp_dir().join("load_all_segment_runs_happy_path.csv"),
-            "start,end,deaths\n0,100,10\n1000,2000,2\n",
+            "start,end,deaths,canceled\n0,100,10,0\n1000,2000,2,1\n",
         )
         .unwrap();
-        let segment_runs = SegmentRun::load_all(&temp_file.path).unwrap();
+        let segment_runs = SegmentRun::load_all(&temp_file.path, true).unwrap();
         assert_eq!(segment_runs.len(), 2);
         let segment_run = segment_runs[0];
         assert_eq!(segment_run.deaths, 10);
         assert_eq!(segment_run.duration(), Duration::from_millis(100));
+        assert!(!segment_run.canceled);
         let segment_run = segment_runs[1];
         assert_eq!(segment_run.deaths, 2);
         assert_eq!(segment_run.duration(), Duration::from_millis(1000));
+        assert!(segment_run.canceled);
+        let segment_runs =
+            SegmentRun::load_all(&temp_file.path, false).unwrap();
+        assert_eq!(segment_runs.len(), 1);
+        let segment_run = segment_runs[0];
+        assert_eq!(segment_run.deaths, 10);
+        assert_eq!(segment_run.duration(), Duration::from_millis(100));
+        assert!(!segment_run.canceled);
     }
 
     /// Tests that the RunPart::save function can both create new files and append existing ones
@@ -793,11 +852,12 @@ mod tests {
                 start: MillisecondsSinceEpoch(1000),
                 end: MillisecondsSinceEpoch(91000),
             },
+            canceled: false,
         };
         first.save(&path).unwrap();
         assert_eq!(
             fs::read_to_string(path.clone()).unwrap().as_str(),
-            "start,end,deaths\n1000,91000,3\n"
+            "start,end,deaths,canceled\n1000,91000,3,0\n"
         );
         let second = SegmentRun {
             deaths: 1,
@@ -805,11 +865,12 @@ mod tests {
                 start: MillisecondsSinceEpoch(100000),
                 end: MillisecondsSinceEpoch(200000),
             },
+            canceled: true,
         };
         second.save(&path).unwrap();
         assert_eq!(
             fs::read_to_string(path).unwrap().as_str(),
-            "start,end,deaths\n1000,91000,3\n100000,200000,1\n"
+            "start,end,deaths,canceled\n1000,91000,3,0\n100000,200000,1,1\n"
         );
     }
 
@@ -931,6 +992,7 @@ mod tests {
                 start: MillisecondsSinceEpoch(0),
                 end: MillisecondsSinceEpoch(3624000),
             },
+            canceled: false,
         }]);
         let duration = Duration::from_secs(3624);
         let stats = SegmentStats::from_runs(runs.into_iter()).unwrap();
@@ -956,6 +1018,7 @@ mod tests {
                     start: MillisecondsSinceEpoch(0),
                     end: MillisecondsSinceEpoch(3624000),
                 },
+                canceled: false,
             },
             SegmentRun {
                 deaths: 6,
@@ -963,6 +1026,7 @@ mod tests {
                     start: MillisecondsSinceEpoch(0),
                     end: MillisecondsSinceEpoch(3600000),
                 },
+                canceled: false,
             },
         ]);
         let stats = SegmentStats::from_runs(runs.into_iter()).unwrap();
@@ -989,6 +1053,7 @@ mod tests {
                     start: MillisecondsSinceEpoch(0),
                     end: MillisecondsSinceEpoch(20000),
                 },
+                canceled: false,
             },
             SegmentRun {
                 deaths: 2,
@@ -996,6 +1061,7 @@ mod tests {
                     start: MillisecondsSinceEpoch(0),
                     end: MillisecondsSinceEpoch(30000),
                 },
+                canceled: false,
             },
             SegmentRun {
                 deaths: 6,
@@ -1003,6 +1069,7 @@ mod tests {
                     start: MillisecondsSinceEpoch(0),
                     end: MillisecondsSinceEpoch(100000),
                 },
+                canceled: false,
             },
         ]);
         let stats = SegmentStats::from_runs(runs.into_iter()).unwrap();
@@ -1015,5 +1082,118 @@ mod tests {
         assert_eq!(6u32, stats.deaths.worst);
         assert_eq!(3f32, stats.deaths.mean);
         assert_eq!(2f32, stats.deaths.median);
+    }
+
+    /// Tests the SegmentRun::run associated function with a single death and segment end.
+    #[test]
+    fn run_single_happy_path() {
+        let start = MillisecondsSinceEpoch::now();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let input_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            event_sender.send(SegmentRunEvent::Death).unwrap();
+            event_sender.send(SegmentRunEvent::End).unwrap();
+        });
+        let run = SegmentRun::run(&event_receiver, start).unwrap();
+        input_thread.join().unwrap();
+        assert_eq!(run.deaths, 1);
+        assert!(run.duration().as_millis() >= 9);
+        assert!(!run.canceled);
+    }
+
+    /// Tests the SegmentRun::run associated function
+    /// with a single death and then a cancellation.
+    #[test]
+    fn run_single_canceled() {
+        let start = MillisecondsSinceEpoch::now();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let input_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            event_sender.send(SegmentRunEvent::Death).unwrap();
+            event_sender.send(SegmentRunEvent::Death).unwrap();
+            event_sender.send(SegmentRunEvent::Cancel).unwrap();
+        });
+        let run = SegmentRun::run(&event_receiver, start).unwrap();
+        input_thread.join().unwrap();
+        assert_eq!(run.deaths, 2);
+        assert!(run.duration().as_millis() >= 9);
+        assert!(run.canceled);
+    }
+
+    /// Tests the SegmentRun::run_consecutive associated function
+    /// with a three segment run with no cancellations.
+    #[test]
+    fn run_multiple_happy_path() {
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (segment_run_sender, segment_run_receiver) = mpsc::channel();
+        let input_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            event_sender.send(SegmentRunEvent::Death).unwrap();
+            event_sender.send(SegmentRunEvent::Death).unwrap();
+            event_sender.send(SegmentRunEvent::End).unwrap();
+            thread::sleep(Duration::from_millis(10));
+            event_sender.send(SegmentRunEvent::Death).unwrap();
+            event_sender.send(SegmentRunEvent::End).unwrap();
+            thread::sleep(Duration::from_millis(10));
+            event_sender.send(SegmentRunEvent::End).unwrap();
+        });
+        let output_thread = thread::spawn(move || {
+            let mut runs = Vec::new();
+            while let Ok(run) = segment_run_receiver.recv() {
+                runs.push(run);
+            }
+            runs
+        });
+        SegmentRun::run_consecutive(3, event_receiver, segment_run_sender)
+            .unwrap();
+        input_thread.join().unwrap();
+        let runs = output_thread.join().unwrap();
+        assert_eq!(runs.len(), 3);
+        let (first_run, second_run, third_run) = (runs[0], runs[1], runs[2]);
+        assert_eq!(first_run.deaths, 2);
+        assert!(first_run.duration().as_millis() >= 9);
+        assert!(!first_run.canceled);
+        assert_eq!(second_run.deaths, 1);
+        assert!(second_run.duration().as_millis() >= 9);
+        assert!(!second_run.canceled);
+        assert_eq!(third_run.deaths, 0);
+        assert!(third_run.duration().as_millis() >= 9);
+        assert!(!third_run.canceled);
+    }
+
+    /// Tests the SegmentRun::run_consecutive associated function with
+    /// a three segment run that is canceled during the second segment.
+    #[test]
+    fn run_multiple_canceled() {
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (segment_run_sender, segment_run_receiver) = mpsc::channel();
+        let input_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            event_sender.send(SegmentRunEvent::Death).unwrap();
+            event_sender.send(SegmentRunEvent::Death).unwrap();
+            event_sender.send(SegmentRunEvent::End).unwrap();
+            thread::sleep(Duration::from_millis(10));
+            event_sender.send(SegmentRunEvent::Death).unwrap();
+            event_sender.send(SegmentRunEvent::Cancel).unwrap();
+        });
+        let output_thread = thread::spawn(move || {
+            let mut runs = Vec::new();
+            while let Ok(run) = segment_run_receiver.recv() {
+                runs.push(run);
+            }
+            runs
+        });
+        SegmentRun::run_consecutive(3, event_receiver, segment_run_sender)
+            .unwrap();
+        input_thread.join().unwrap();
+        let runs = output_thread.join().unwrap();
+        assert_eq!(runs.len(), 2);
+        let (first_run, second_run) = (runs[0], runs[1]);
+        assert_eq!(first_run.deaths, 2);
+        assert!(first_run.duration().as_millis() >= 9);
+        assert!(!first_run.canceled);
+        assert_eq!(second_run.deaths, 1);
+        assert!(second_run.duration().as_millis() >= 9);
+        assert!(second_run.canceled);
     }
 }

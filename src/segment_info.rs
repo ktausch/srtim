@@ -289,6 +289,7 @@ impl<'a> RunPart<'a> {
     ///     supplemented_segment_run_sender: sending side of a channel where
     ///         completed run parts will be sent as they are completed. Every
     ///         run
+    ///     write: if true, then write to files. Otherwise, no writing to disk
     pub fn run(
         &'a self,
         segment_run_event_receiver: Receiver<SegmentRunEvent>,
@@ -321,7 +322,7 @@ impl<'a> RunPart<'a> {
                     None => vec![],
                 };
                 let mut nesting = last_segment_names.len() as u8;
-                let segment_run = segment_run_receiver
+                let segment_run: SegmentRun = segment_run_receiver
                     .recv()
                     .map_err(|_| Error::SegmentRunSenderClosed)?;
                 maybe_top_level_accumulation =
@@ -329,6 +330,7 @@ impl<'a> RunPart<'a> {
                         maybe_top_level_accumulation,
                         &segment_run,
                     )?);
+                let canceled = segment_run.canceled;
                 let mut num_continuing_parts = 0u8;
                 for PartCore {
                     display_name: continuing_part_name,
@@ -348,20 +350,26 @@ impl<'a> RunPart<'a> {
                     }
                 }
                 let num_continuing_parts = num_continuing_parts as usize;
-                while last_segment_names.len() > num_continuing_parts {
+                while last_segment_names.len()
+                    > (if canceled { 0 } else { num_continuing_parts })
+                {
                     let PartCore {
                         display_name: last_segment_name,
                         file_name: last_segment_path,
                         ..
                     } = last_segment_names.pop().unwrap();
-                    let full_segment_run =
-                        match accumulations.remove_entry(&last_segment_name) {
-                            Some((_, mut full_segment_run)) => {
+                    let full_segment_run = match accumulations
+                        .remove_entry(&last_segment_name)
+                    {
+                        Some((_, mut full_segment_run)) => {
+                            if last_segment_names.len() >= num_continuing_parts
+                            {
                                 full_segment_run.accumulate(&segment_run)?;
-                                full_segment_run
                             }
-                            None => segment_run,
-                        };
+                            full_segment_run
+                        }
+                        None => segment_run,
+                    };
                     match supplemented_segment_run_sender.send(
                         SupplementedSegmentRun {
                             nesting,
@@ -384,6 +392,9 @@ impl<'a> RunPart<'a> {
                         }
                     }
                     nesting -= 1;
+                }
+                if canceled {
+                    break;
                 }
                 last_segment_names = next_segment_names;
                 if last_segment_names.is_empty() {
@@ -417,8 +428,11 @@ impl<'a> RunPart<'a> {
     }
 
     /// Gets all runs of the given run part
-    pub fn get_runs(&self) -> Result<Arc<[SegmentRun]>> {
-        match SegmentRun::load_all(self.file_name()) {
+    pub fn get_runs(
+        &self,
+        include_canceled: bool,
+    ) -> Result<Arc<[SegmentRun]>> {
+        match SegmentRun::load_all(self.file_name(), include_canceled) {
             Ok(runs) => Ok(runs),
             Err(Error::CouldNotReadSegmentRunFile { path, error }) => {
                 if error.kind() == ErrorKind::NotFound {
@@ -436,6 +450,7 @@ impl<'a> RunPart<'a> {
 mod tests {
     use super::*;
     use std::ptr;
+    use std::time::Duration;
 
     use crate::coerce_pattern;
 
@@ -712,5 +727,175 @@ AAAA\tAA\tA
             SegmentInfo::new(Arc::from("A"), PathBuf::from("/a.txt")).unwrap();
         let a_part = RunPart::SingleSegment(&a);
         assert_eq!(a_part.tree().as_str(), "A")
+    }
+
+    /// Ensures that RunPart::run works as expected when no cancelation is done. In particular,
+    /// the run doesn't short-circuit and all produced SegmentRun objects are not canceled.
+    #[test]
+    fn test_run_ab_no_cancel() {
+        let a = SegmentInfo {
+            display_name: Arc::from("A"),
+            file_name: PathBuf::from("/a.txt"),
+        };
+        let ap = RunPart::SingleSegment(&a);
+        let b = SegmentInfo {
+            display_name: Arc::from("B"),
+            file_name: PathBuf::from("/b.txt"),
+        };
+        let bp = RunPart::SingleSegment(&b);
+        let path = PathBuf::from("/ab.txt");
+        let abp = RunPart::Group {
+            components: Arc::from([&ap, &bp]),
+            display_name: Arc::from("AB"),
+            file_name: &path,
+        };
+        let (segment_run_event_sender, segment_run_event_receiver) =
+            mpsc::channel();
+        let (
+            supplemented_segment_run_sender,
+            supplemented_segment_run_receiver,
+        ) = mpsc::channel();
+        let input_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            segment_run_event_sender
+                .send(SegmentRunEvent::Death)
+                .unwrap();
+            segment_run_event_sender.send(SegmentRunEvent::End).unwrap();
+            thread::sleep(Duration::from_millis(5));
+            segment_run_event_sender.send(SegmentRunEvent::End).unwrap();
+        });
+        let output_thread = thread::spawn(move || {
+            let mut supplemented_segment_runs = Vec::new();
+            while let Ok(run) = supplemented_segment_run_receiver.recv() {
+                supplemented_segment_runs.push(run);
+            }
+            supplemented_segment_runs
+        });
+        abp.run(
+            segment_run_event_receiver,
+            supplemented_segment_run_sender,
+            false,
+        )
+        .unwrap();
+        input_thread.join().unwrap();
+        let supplemented_segment_runs = output_thread.join().unwrap();
+        assert_eq!(supplemented_segment_runs.len(), 3);
+        let (first_run, second_run, third_run) = (
+            &supplemented_segment_runs[0],
+            &supplemented_segment_runs[1],
+            &supplemented_segment_runs[2],
+        );
+        assert_eq!(first_run.nesting, 1);
+        assert_eq!(&first_run.name as &str, "A");
+        assert!(!first_run.segment_run.canceled);
+        assert_eq!(first_run.segment_run.deaths, 1);
+        assert!(first_run.segment_run.duration().as_millis() >= 4);
+        assert_eq!(second_run.nesting, 1);
+        assert_eq!(&second_run.name as &str, "B");
+        assert!(!second_run.segment_run.canceled);
+        assert_eq!(second_run.segment_run.deaths, 0);
+        assert!(second_run.segment_run.duration().as_millis() >= 4);
+        assert_eq!(third_run.nesting, 0);
+        assert_eq!(&third_run.name as &str, "AB");
+        assert!(!third_run.segment_run.canceled);
+        assert_eq!(third_run.segment_run.deaths, 1);
+        assert!(third_run.segment_run.duration().as_millis() >= 9);
+    }
+
+    /// Ensures that the RunPart::run method works correctly when canceled. In
+    /// particular, this test runs ((AB)C) when it is canceled during B. This
+    /// should lead to:
+    /// 1. A, nesting 2, not canceled
+    /// 2. B, nesting 2, canceled
+    /// 3. AB, nesting 1, canceled
+    /// 4. ABC, nesting 0, canceled
+    #[test]
+    fn test_run_abc_canceled() {
+        let a = SegmentInfo {
+            display_name: Arc::from("A"),
+            file_name: PathBuf::from("/a.txt"),
+        };
+        let ap = RunPart::SingleSegment(&a);
+        let b = SegmentInfo {
+            display_name: Arc::from("B"),
+            file_name: PathBuf::from("/b.txt"),
+        };
+        let bp = RunPart::SingleSegment(&b);
+        let ab_path = PathBuf::from("/ab.txt");
+        let abp = RunPart::Group {
+            components: Arc::from([&ap, &bp]),
+            display_name: Arc::from("AB"),
+            file_name: &ab_path,
+        };
+        let c = SegmentInfo {
+            display_name: Arc::from("C"),
+            file_name: PathBuf::from("/c.txt"),
+        };
+        let cp = RunPart::SingleSegment(&c);
+        let abc_path = PathBuf::from("/abc.txt");
+        let abcp = RunPart::Group {
+            components: Arc::from([&abp, &cp]),
+            display_name: Arc::from("ABC"),
+            file_name: &abc_path,
+        };
+        let (segment_run_event_sender, segment_run_event_receiver) =
+            mpsc::channel();
+        let (
+            supplemented_segment_run_sender,
+            supplemented_segment_run_receiver,
+        ) = mpsc::channel();
+        let input_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            segment_run_event_sender
+                .send(SegmentRunEvent::Death)
+                .unwrap();
+            segment_run_event_sender.send(SegmentRunEvent::End).unwrap();
+            thread::sleep(Duration::from_millis(5));
+            segment_run_event_sender
+                .send(SegmentRunEvent::Cancel)
+                .unwrap();
+        });
+        let output_thread = thread::spawn(move || {
+            let mut supplemented_segment_runs = Vec::new();
+            while let Ok(run) = supplemented_segment_run_receiver.recv() {
+                supplemented_segment_runs.push(run);
+            }
+            supplemented_segment_runs
+        });
+        abcp.run(
+            segment_run_event_receiver,
+            supplemented_segment_run_sender,
+            false,
+        )
+        .unwrap();
+        input_thread.join().unwrap();
+        let supplemented_segment_runs = output_thread.join().unwrap();
+        assert_eq!(supplemented_segment_runs.len(), 4);
+        let (first_run, second_run, third_run, fourth_run) = (
+            &supplemented_segment_runs[0],
+            &supplemented_segment_runs[1],
+            &supplemented_segment_runs[2],
+            &supplemented_segment_runs[3],
+        );
+        assert_eq!(first_run.nesting, 2);
+        assert_eq!(&first_run.name as &str, "A");
+        assert!(!first_run.segment_run.canceled);
+        assert_eq!(first_run.segment_run.deaths, 1);
+        assert!(first_run.segment_run.duration().as_millis() >= 4);
+        assert_eq!(second_run.nesting, 2);
+        assert_eq!(&second_run.name as &str, "B");
+        assert!(second_run.segment_run.canceled);
+        assert_eq!(second_run.segment_run.deaths, 0);
+        assert!(second_run.segment_run.duration().as_millis() >= 4);
+        assert_eq!(third_run.nesting, 1);
+        assert_eq!(&third_run.name as &str, "AB");
+        assert!(third_run.segment_run.canceled);
+        assert_eq!(third_run.segment_run.deaths, 1);
+        assert!(third_run.segment_run.duration().as_millis() >= 9);
+        assert_eq!(fourth_run.nesting, 0);
+        assert_eq!(&fourth_run.name as &str, "ABC");
+        assert!(fourth_run.segment_run.canceled);
+        assert_eq!(fourth_run.segment_run.deaths, 1);
+        assert!(fourth_run.segment_run.duration().as_millis() >= 9);
     }
 }
