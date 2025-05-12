@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
-use crate::coerce_pattern;
+use crate::{MillisecondsSinceEpoch, coerce_pattern};
 
 use crate::error::{Error, Result};
 use crate::segment_info::{RunPart, SegmentGroupInfo, SegmentInfo};
 use crate::segment_run::{
-    SegmentRunEvent, SegmentStats, SupplementedSegmentRun,
+    Interval, SegmentRun, SegmentRunEvent, SegmentStats,
+    SupplementedSegmentRun, format_duration,
 };
 use crate::utils::load_n_tokens;
 
@@ -715,23 +716,61 @@ impl Config {
     }
 
     /// Gets the best, worst, mean, and median duration and death of given part
-    pub fn get_stats<'a>(
+    pub fn get_stats<'a, D, N>(
         &self,
         id_name: &'a str,
-        during: Option<&'a str>,
-    ) -> Result<Option<SegmentStats>> {
+        during: D,
+        not_during: N,
+    ) -> Result<Option<SegmentStats>>
+    where
+        D: IntoIterator<Item = &'a str>,
+        N: IntoIterator<Item = &'a str>,
+    {
+        let start = MillisecondsSinceEpoch::now();
         let runs =
-            self.use_run_info(id_name, |run_part| run_part.get_runs())??;
-        match during {
-            Some(during) => {
-                let during =
-                    self.use_run_info(during, |run_part| run_part.get_runs())??;
-                Ok(SegmentStats::from_runs(runs.into_iter().filter(|run| {
-                    during.iter().any(|d| d.interval.contains(&run.interval))
-                })))
-            }
-            None => Ok(SegmentStats::from_runs(runs.into_iter())),
+            self.use_run_info(id_name, |run_part| run_part.get_runs(false))??;
+        let mut during_parts = Vec::new();
+        for d in during {
+            during_parts.push(
+                self.use_run_info(d, |run_part| run_part.get_runs(true))??,
+            );
         }
+        let mut not_during_parts = Vec::new();
+        for n in not_during {
+            not_during_parts.push(
+                self.use_run_info(n, |run_part| run_part.get_runs(true))??,
+            );
+        }
+        let mut filtered_runs = Vec::new();
+        'outer: for run_index in 0..runs.len() {
+            let run: &SegmentRun = &runs[run_index];
+            for during_part_index in 0..during_parts.len() {
+                let during_part =
+                    &during_parts[during_part_index] as &[SegmentRun];
+                if !during_part.iter().any(|during_run: &SegmentRun| {
+                    during_run.interval.contains(&run.interval)
+                }) {
+                    continue 'outer;
+                }
+            }
+            for not_during_part_index in 0..not_during_parts.len() {
+                let not_during_part =
+                    &not_during_parts[not_during_part_index] as &[SegmentRun];
+                if not_during_part.iter().any(|not_during_run: &SegmentRun| {
+                    not_during_run.interval.contains(&run.interval)
+                }) {
+                    continue 'outer;
+                }
+            }
+            filtered_runs.push(run);
+        }
+        let end = MillisecondsSinceEpoch::now();
+        let interval = Interval { start, end };
+        println!(
+            "Getting stats took {}",
+            format_duration(interval.duration())
+        );
+        Ok(SegmentStats::from_runs(filtered_runs))
     }
 }
 
@@ -739,6 +778,7 @@ impl Config {
 mod tests {
     use super::*;
     use std::env::temp_dir;
+    use std::io::ErrorKind;
     use std::ptr;
     use std::sync::mpsc;
     use std::thread;
@@ -1249,36 +1289,146 @@ mod tests {
         let ababc_file = TempFile {
             path: config.root.join("ababc.csv"),
         };
-        let a_runs = SegmentRun::load_all(&a_file.path).unwrap();
+        let a_runs = SegmentRun::load_all(&a_file.path, true).unwrap();
         assert_eq!(a_runs.len(), 2);
         assert_eq!(a_runs[0].deaths, 1);
         assert!(a_runs[0].duration() >= Duration::from_millis(30));
         assert_eq!(a_runs[1].deaths, 0);
         assert!(a_runs[1].duration() >= Duration::from_millis(15));
-        let b_runs = SegmentRun::load_all(&b_file.path).unwrap();
+        let b_runs = SegmentRun::load_all(&b_file.path, true).unwrap();
         assert_eq!(b_runs.len(), 2);
         assert_eq!(b_runs[0].deaths, 2);
         assert!(b_runs[0].duration() >= Duration::from_millis(35));
         assert_eq!(b_runs[1].deaths, 3);
         assert!(b_runs[1].duration() >= Duration::from_millis(50));
-        let c_runs = SegmentRun::load_all(&c_file.path).unwrap();
+        let c_runs = SegmentRun::load_all(&c_file.path, true).unwrap();
         assert_eq!(c_runs.len(), 1);
         assert_eq!(c_runs[0].deaths, 0);
         assert!(c_runs[0].duration() >= Duration::from_millis(10));
-        let ab_runs = SegmentRun::load_all(&ab_file.path).unwrap();
+        let ab_runs = SegmentRun::load_all(&ab_file.path, true).unwrap();
         assert_eq!(ab_runs.len(), 2);
         assert_eq!(ab_runs[0].deaths, 3);
         assert!(ab_runs[0].duration() >= Duration::from_millis(65));
         assert_eq!(ab_runs[1].deaths, 3);
         assert!(ab_runs[1].duration() >= Duration::from_millis(65));
-        let abc_runs = SegmentRun::load_all(&abc_file.path).unwrap();
+        let abc_runs = SegmentRun::load_all(&abc_file.path, true).unwrap();
         assert_eq!(abc_runs.len(), 1);
         assert_eq!(abc_runs[0].deaths, 3);
         assert!(abc_runs[0].duration() >= Duration::from_millis(75));
-        let ababc_runs = SegmentRun::load_all(&ababc_file.path).unwrap();
+        let ababc_runs = SegmentRun::load_all(&ababc_file.path, true).unwrap();
         assert_eq!(ababc_runs.len(), 1);
         assert_eq!(ababc_runs[0].deaths, 6);
         assert!(ababc_runs[0].duration() >= Duration::from_millis(140));
+    }
+
+    /// Uses the RunPart::run function to initiate and complete a
+    /// timed run of a segment group. This test cancels the run.
+    #[test]
+    fn test_multi_segment_run_part_canceled() {
+        let (config, _temp_file) =
+            make_abcd_config("test_multi_segment_run_part_canceled");
+        config.save().unwrap();
+        let group_id_name = "ababc";
+        let (segment_run_event_sender, segment_run_event_receiver) =
+            mpsc::channel();
+        let (
+            supplemented_segment_run_sender,
+            supplemented_segment_run_receiver,
+        ) = mpsc::channel();
+        let run_event_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            segment_run_event_sender
+                .send(SegmentRunEvent::Cancel)
+                .unwrap();
+        });
+        let run_thread = thread::spawn(move || {
+            let SupplementedSegmentRun {
+                nesting,
+                name,
+                segment_run,
+            } = supplemented_segment_run_receiver.recv().unwrap();
+            assert_eq!(nesting, 2);
+            assert_eq!(&name as &str, "A");
+            assert_eq!(segment_run.deaths, 0);
+            assert!(segment_run.canceled);
+            assert!(segment_run.duration() >= Duration::from_millis(20));
+            let SupplementedSegmentRun {
+                nesting,
+                name,
+                segment_run,
+            } = supplemented_segment_run_receiver.recv().unwrap();
+            assert_eq!(nesting, 1);
+            assert_eq!(&name as &str, "AB");
+            assert_eq!(segment_run.deaths, 0);
+            assert!(segment_run.canceled);
+            assert!(segment_run.duration() >= Duration::from_millis(20));
+            let SupplementedSegmentRun {
+                nesting,
+                name,
+                segment_run,
+            } = supplemented_segment_run_receiver.recv().unwrap();
+            assert_eq!(nesting, 0);
+            assert_eq!(&name as &str, "ABABC");
+            assert_eq!(segment_run.deaths, 0);
+            assert!(segment_run.canceled);
+            assert!(segment_run.duration() >= Duration::from_millis(20));
+        });
+        config
+            .run(
+                group_id_name,
+                segment_run_event_receiver,
+                supplemented_segment_run_sender,
+                true,
+            )
+            .unwrap();
+        run_event_thread.join().unwrap();
+        run_thread.join().unwrap();
+        let a_file = TempFile {
+            path: config.root.join("a.csv"),
+        };
+        let b_file = TempFile {
+            path: config.root.join("b.csv"),
+        };
+        let c_file = TempFile {
+            path: config.root.join("c.csv"),
+        };
+        let ab_file = TempFile {
+            path: config.root.join("ab.csv"),
+        };
+        let abc_file = TempFile {
+            path: config.root.join("abc.csv"),
+        };
+        let ababc_file = TempFile {
+            path: config.root.join("ababc.csv"),
+        };
+        let a_runs = SegmentRun::load_all(&a_file.path, true).unwrap();
+        assert_eq!(a_runs.len(), 1);
+        assert_eq!(a_runs[0].deaths, 0);
+        assert!(a_runs[0].duration() >= Duration::from_millis(20));
+        assert!(a_runs[0].canceled);
+        for path in [&b_file.path, &c_file.path, &abc_file.path] {
+            assert_eq!(
+                coerce_pattern!(
+                    SegmentRun::load_all(path, true),
+                    Err(Error::CouldNotReadSegmentRunFile { error, .. }),
+                    error
+                )
+                .kind(),
+                ErrorKind::NotFound
+            );
+        }
+        let ab_runs = SegmentRun::load_all(&ab_file.path, true).unwrap();
+        assert_eq!(ab_runs.len(), 1);
+        assert_eq!(ab_runs[0].deaths, 0);
+        assert!(ab_runs[0].duration() >= Duration::from_millis(20));
+        assert!(ab_runs[0].canceled);
+        let ab_runs = SegmentRun::load_all(&ab_file.path, false).unwrap();
+        assert!(ab_runs.is_empty());
+        let ababc_runs = SegmentRun::load_all(&ababc_file.path, true).unwrap();
+        assert_eq!(ababc_runs.len(), 1);
+        assert_eq!(ababc_runs[0].deaths, 0);
+        assert!(ababc_runs[0].duration() >= Duration::from_millis(20));
+        assert!(ababc_runs[0].canceled);
     }
 
     /// Tests that the Config::use_run_info function returns an
@@ -1794,23 +1944,35 @@ g: G\tSegment"
         config.save().unwrap();
         assert_eq!(
             &coerce_pattern!(
-                config.get_stats("z", None),
+                config.get_stats("z", Vec::new(), Vec::new()),
                 Err(Error::IdNameNotFound { id_name }),
                 id_name
             ) as &str,
             "z"
         );
-        assert!(config.get_stats("b", None).unwrap().is_none());
+        assert!(
+            config
+                .get_stats("b", Vec::new(), Vec::new())
+                .unwrap()
+                .is_none()
+        );
+        let _temp_file_a = TempFile {
+            path: config.root.join("a.csv"),
+        };
         SegmentRun {
             deaths: 0,
             interval: Interval {
                 start: MillisecondsSinceEpoch(0),
                 end: MillisecondsSinceEpoch(10000),
             },
+            canceled: false,
         }
         .save(&config.root.join("a.csv"))
         .unwrap();
-        let stats = config.get_stats("a", None).unwrap().unwrap();
+        let stats = config
+            .get_stats("a", Vec::new(), Vec::new())
+            .unwrap()
+            .unwrap();
         assert_eq!(Duration::from_secs(10), stats.durations.best);
         assert_eq!(Duration::from_secs(10), stats.durations.worst);
         assert_eq!(Duration::from_secs(10), stats.durations.mean);

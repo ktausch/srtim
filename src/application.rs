@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::input::Input;
 use crate::segment_run::{
-    MillisecondsSinceEpoch, SegmentRunEvent, SegmentStats,
+    MillisecondsSinceEpoch, SegmentRun, SegmentRunEvent, SegmentStats,
     SupplementedSegmentRun, format_duration,
 };
 
@@ -248,8 +248,19 @@ where
 {
     let id_name = input.extract_option_single_value("--id-name")?;
     let include_deaths = input.extract_option_no_values("--include-deaths")?;
-    let during = input.extract_option_single_value("--during").ok();
-    match config.get_stats(&id_name, during.as_ref().map(|d| d as &str))? {
+    let during = match input.extract_option("--during") {
+        None => Arc::from([]),
+        Some((_, during)) => during,
+    };
+    let not_during = match input.extract_option("--not-during") {
+        None => Arc::from([]),
+        Some((_, not_during)) => not_during,
+    };
+    match config.get_stats(
+        &id_name,
+        (&during as &[Arc<str>]).iter().map(|x| x as &str),
+        (&not_during as &[Arc<str>]).iter().map(|x| x as &str),
+    )? {
         None => {
             custom_output.println(format!(
                 "Segment with ID name \"{id_name}\" has no runs yet."
@@ -337,17 +348,22 @@ where
             let string = custom_input
                 .get_line()
                 .map_err(|error| Error::CouldNotReadFromStdin { error })?;
-            let trimmed = string.trim();
-            let segment_run_event = if trimmed.is_empty() {
-                num_ends += 1;
-                SegmentRunEvent::End
-            } else {
-                if trimmed != "d" {
-                    custom_output_clone.eprintln(
-                        String::from("Interpreting error as death even though line contained something other than just \"d\"")
-                    );
+            let segment_run_event = match string.trim() {
+                "" => {
+                    num_ends += 1;
+                    SegmentRunEvent::End
                 }
-                SegmentRunEvent::Death
+                "d" => SegmentRunEvent::Death,
+                "c" => {
+                    num_ends = num_segments;
+                    SegmentRunEvent::Cancel
+                }
+                trimmed => {
+                    custom_output_clone.eprintln(
+                        format!("Cannot parse an event from the input \"{trimmed}\". Ignoring.")
+                    );
+                    continue;
+                }
             };
             segment_run_event_sender
                 .send(segment_run_event)
@@ -363,21 +379,26 @@ where
         while let Ok(SupplementedSegmentRun {
             nesting,
             name,
-            segment_run,
+            segment_run:
+                SegmentRun {
+                    interval,
+                    deaths,
+                    canceled,
+                },
         }) = supplemented_segment_run_receiver.recv()
         {
             if let None = start {
-                start = Some(segment_run.interval.start);
+                start = Some(interval.start);
             }
             custom_output_clone.println(format!(
-                "{}{name}{}, duration: {}{}",
+                "{}{name}{}, duration: {}{}{}",
                 "\t".repeat(nesting as usize),
                 if no_deaths {
                     String::new()
                 } else {
-                    format!(", deaths: {}", segment_run.deaths)
+                    format!(", deaths: {}", deaths)
                 },
-                format_duration(segment_run.duration()),
+                format_duration(interval.duration()),
                 if nesting == 0 {
                     String::new()
                 } else {
@@ -385,10 +406,11 @@ where
                         ", total time elapsed: {}",
                         format_duration(MillisecondsSinceEpoch::duration(
                             start.unwrap(),
-                            segment_run.interval.end,
+                            interval.end,
                         )?)
                     )
                 },
+                if canceled { " CANCELED" } else { "" }
             ));
         }
         Ok(())
@@ -710,6 +732,70 @@ mod tests {
         }
     }
 
+    /// Tests the end-to-end flow that occurs when a run is canceled.
+    #[test]
+    fn test_run_segment_cancel() {
+        let input = Input::collect(
+            ["<binary>", "run", "--id-name", "a"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        let root = temp_dir().join("test_run_segment_cancel");
+        let _temp_file_config = TempFile {
+            path: root.join("config.tsv"),
+        };
+        let temp_file_a_segment = TempFile {
+            path: root.join("a.csv"),
+        };
+        let mut config = Config::new(root);
+        config.add_segment(Arc::from("a"), Arc::from("A")).unwrap();
+        config.save().unwrap();
+        let custom_input = TestCustomInput::new(
+            [("\n", 0), ("d\n", 4), ("c\n", 5)]
+                .into_iter()
+                .map(|(string, number)| (String::from(string), number)),
+        );
+        let custom_output = TestCustomOutput::new();
+        run_application_base(input, config, custom_input, &custom_output)
+            .unwrap();
+        let segments =
+            SegmentRun::load_all(&temp_file_a_segment.path, true).unwrap();
+        assert_eq!(segments.len(), 1);
+        let SegmentRun {
+            interval,
+            deaths,
+            canceled,
+        } = segments[0];
+        assert!(interval.duration().as_millis() >= 9);
+        assert_eq!(deaths, 1);
+        assert!(canceled);
+        let mut custom_output = custom_output.consume().into_iter();
+        assert_eq!(
+            coerce_pattern!(
+                custom_output.next(),
+                Some(TestOutputMessage {
+                    is_error: false,
+                    message
+                }),
+                message
+            )
+            .as_str(),
+            "Starting!"
+        );
+        assert!(
+            coerce_pattern!(
+                custom_output.next(),
+                Some(TestOutputMessage {
+                    is_error: false,
+                    message
+                }),
+                message
+            )
+            .ends_with("CANCELED")
+        );
+    }
+
     /// Tests the run_part_from_input_base function that contains the main
     /// functionality of the run system. The only part that can't be tested
     /// is reading from stdin, so a TestLineGetter is used in place of the
@@ -771,21 +857,23 @@ mod tests {
         run_application_base(input, config, custom_input, &custom_output)
             .unwrap();
         let mut custom_output = custom_output.consume().into_iter();
-        let segments = SegmentRun::load_all(&temp_file_a_segment.path).unwrap();
+        let segments =
+            SegmentRun::load_all(&temp_file_a_segment.path, true).unwrap();
         assert_eq!(segments.len(), 3);
         let segment = segments[0];
         assert_eq!(segment.deaths, 2);
         let first_a_duration = segment.duration();
         assert!(first_a_duration >= Duration::from_millis(19));
         let segment = segments[1];
-        assert_eq!(segment.deaths, 3);
+        assert_eq!(segment.deaths, 2);
         let second_a_duration = segment.duration();
         assert!(second_a_duration >= Duration::from_millis(29));
         let segment = segments[2];
         assert_eq!(segment.deaths, 0);
         let third_a_duration = segment.duration();
         assert!(third_a_duration >= Duration::from_millis(9));
-        let segments = SegmentRun::load_all(&temp_file_b_segment.path).unwrap();
+        let segments =
+            SegmentRun::load_all(&temp_file_b_segment.path, true).unwrap();
         assert_eq!(segments.len(), 2);
         let segment = segments[0];
         assert_eq!(segment.deaths, 1);
@@ -796,10 +884,10 @@ mod tests {
         let second_b_duration = segment.duration();
         assert!(second_b_duration >= Duration::from_millis(24));
         let segments =
-            SegmentRun::load_all(&temp_file_segment_group.path).unwrap();
+            SegmentRun::load_all(&temp_file_segment_group.path, true).unwrap();
         assert_eq!(segments.len(), 1);
         let segment = segments[0];
-        assert_eq!(segment.deaths, 6);
+        assert_eq!(segment.deaths, 5);
         assert!(segment.duration() >= Duration::from_millis(159));
         assert_eq!(custom_output.next().unwrap().ok(), "Starting!");
         let mut total_duration = first_a_duration;
@@ -834,13 +922,13 @@ mod tests {
         );
         assert_eq!(
             custom_output.next().unwrap().error(),
-            "Interpreting error as death even though line contained something other than just \"d\""
+            "Cannot parse an event from the input \"death\". Ignoring."
         );
         total_duration += second_a_duration;
         assert_eq!(
             custom_output.next().unwrap().ok(),
             format!(
-                "\tA, deaths: 3, duration: {}, total time elapsed: {}",
+                "\tA, deaths: 2, duration: {}, total time elapsed: {}",
                 format_duration(second_a_duration),
                 format_duration(total_duration)
             )
@@ -859,7 +947,7 @@ mod tests {
         assert_eq!(
             custom_output.next().unwrap().ok(),
             format!(
-                "ABBAA, deaths: 6, duration: {}",
+                "ABBAA, deaths: 5, duration: {}",
                 format_duration(total_duration)
             )
             .as_str()
@@ -897,7 +985,8 @@ mod tests {
         run_application_base(input, config, custom_input, &custom_output)
             .unwrap();
         let mut custom_output = custom_output.consume().into_iter();
-        let segments = SegmentRun::load_all(&temp_file_a_segment.path).unwrap();
+        let segments =
+            SegmentRun::load_all(&temp_file_a_segment.path, true).unwrap();
         assert_eq!(segments.len(), 1);
         let segment = segments[0];
         assert_eq!(segment.deaths, 2);
@@ -1466,8 +1555,11 @@ c: A\tSegment"
         config.add_segment(Arc::from("d"), Arc::from("D")).unwrap();
         let config = config;
         config.save().unwrap();
-        let _temp_file = TempFile {
+        let _temp_file_a = TempFile {
             path: root.join("a.csv"),
+        };
+        let _temp_file_d = TempFile {
+            path: root.join("d.csv"),
         };
         SegmentRun {
             deaths: 5,
@@ -1475,6 +1567,7 @@ c: A\tSegment"
                 start: MillisecondsSinceEpoch(0),
                 end: MillisecondsSinceEpoch(10000),
             },
+            canceled: false,
         }
         .save(&root.join("a.csv"))
         .unwrap();
@@ -1484,6 +1577,7 @@ c: A\tSegment"
                 start: MillisecondsSinceEpoch(20000),
                 end: MillisecondsSinceEpoch(25000),
             },
+            canceled: false,
         }
         .save(&root.join("a.csv"))
         .unwrap();
@@ -1493,6 +1587,7 @@ c: A\tSegment"
                 start: MillisecondsSinceEpoch(20000),
                 end: MillisecondsSinceEpoch(30000),
             },
+            canceled: false,
         }
         .save(&root.join("d.csv"))
         .unwrap();
@@ -1613,5 +1708,89 @@ c: A\tSegment"
                 "Segment with ID name \"b\" has no runs yet."
             );
         }
+    }
+
+    /// Tests the usage of the "--during" and "--not-during" options in the stats command.
+    #[test]
+    fn test_stats_with_constraints() {
+        let root = temp_dir().join("test_stats_with_constraints");
+        let mut config = Config::new(root.clone());
+        config.add_segment(Arc::from("a"), Arc::from("A")).unwrap();
+        config
+            .add_segment_group(
+                Arc::from("aa"),
+                Arc::from("AA"),
+                Arc::from([Arc::from("a"), Arc::from("a")]),
+            )
+            .unwrap();
+        config
+            .add_segment_group(
+                Arc::from("aaa"),
+                Arc::from("AAA"),
+                Arc::from([Arc::from("a"), Arc::from("aa")]),
+            )
+            .unwrap();
+        config.save().unwrap();
+        let _temp_file_config = TempFile {
+            path: root.join("config.tsv"),
+        };
+        let _temp_file_a = TempFile::with_contents(
+            root.join("a.csv"),
+            "start,end,deaths,canceled\n0,10,1,0\n10,40,3,0\n40,90,5,1\n100,120,2,0\n120,160,4,0\n",
+        )
+        .unwrap();
+        let _temp_file_aa = TempFile::with_contents(
+            root.join("aa.csv"),
+            "start,end,deaths,canceled\n10,90,8,1\n100,160,6,0\n",
+        )
+        .unwrap();
+        let _temp_file_aaa = TempFile::with_contents(
+            root.join("aaa.csv"),
+            "start,end,deaths,canceled\n0,90,9,1\n",
+        )
+        .unwrap();
+        let input = Input::collect(
+            [
+                "<binary>",
+                "stats",
+                "--id-name",
+                "a",
+                "--during",
+                "aa",
+                "--not-during",
+                "aaa",
+                "--include-deaths",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        let custom_input = TestCustomInput::empty();
+        let custom_output = TestCustomOutput::new();
+        run_application_base(input, config, custom_input, &custom_output)
+            .unwrap();
+        let mut custom_output = custom_output.consume().into_iter();
+        assert_eq!(custom_output.next().unwrap().ok(), "# of runs: 2");
+        assert_eq!(
+            custom_output.next().unwrap().ok(),
+            "Best duration: 0.020 s"
+        );
+        assert_eq!(
+            custom_output.next().unwrap().ok(),
+            "Worst duration: 0.040 s"
+        );
+        assert_eq!(
+            custom_output.next().unwrap().ok(),
+            "Mean duration: 0.030 s"
+        );
+        assert_eq!(
+            custom_output.next().unwrap().ok(),
+            "Median duration: 0.030 s"
+        );
+        assert_eq!(custom_output.next().unwrap().ok(), "Best deaths: 2");
+        assert_eq!(custom_output.next().unwrap().ok(), "Worst deaths: 4");
+        assert_eq!(custom_output.next().unwrap().ok(), "Mean deaths: 3.000");
+        assert_eq!(custom_output.next().unwrap().ok(), "Median deaths: 3.0");
+        assert!(custom_output.next().is_none());
     }
 }
