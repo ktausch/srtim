@@ -11,7 +11,7 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
-use crate::utils::load_n_tokens;
+use crate::utils::{IteratorWithMemory, load_n_tokens};
 
 /// A specific instant in time via the number of milliseconds since the unix epoch
 #[derive(Clone, Copy)]
@@ -513,11 +513,65 @@ impl SegmentStats {
     }
 }
 
+/// Collects all runs that are both during a segment in the during list
+/// and not during a segment in the not_during list.
+pub fn filter_runs<'a, R, D, N>(
+    mut runs: R,
+    during: Vec<D>,
+    not_during: Vec<N>,
+) -> Vec<&'a SegmentRun>
+where
+    D: Iterator<Item = &'a SegmentRun>,
+    N: Iterator<Item = &'a SegmentRun>,
+    R: Iterator<Item = &'a SegmentRun>,
+{
+    let mut during_iters: Vec<_> = during
+        .into_iter()
+        .map(|iterator| IteratorWithMemory::new(iterator))
+        .collect();
+    let mut not_during_iters: Vec<_> = not_during
+        .into_iter()
+        .map(|iterator| IteratorWithMemory::new(iterator))
+        .collect();
+    let mut result = Vec::new();
+    'outer: while let Some(run) = runs.next() {
+        let run_end = run.interval.end.0;
+        for during in during_iters.iter_mut() {
+            during.advance_until(|&during_run| {
+                during_run.interval.end.0 >= run_end
+            });
+            match during.current() {
+                Some(&during_run) => {
+                    if during_run.interval.start.0 > run.interval.start.0 {
+                        continue 'outer;
+                    }
+                }
+                None => {
+                    continue 'outer;
+                }
+            }
+        }
+        for not_during in not_during_iters.iter_mut() {
+            not_during.advance_until(|&not_during_run| {
+                not_during_run.interval.end.0 >= run_end
+            });
+            if let Some(&not_during_run) = not_during.current() {
+                if not_during_run.interval.start.0 <= run.interval.start.0 {
+                    continue 'outer;
+                }
+            }
+        }
+        result.push(run);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{assert_pattern, coerce_pattern};
     use std::env::temp_dir;
+    use std::ptr;
     use std::sync::mpsc;
     use std::thread;
 
@@ -1195,5 +1249,103 @@ mod tests {
         assert_eq!(second_run.deaths, 1);
         assert!(second_run.duration().as_millis() >= 9);
         assert!(second_run.canceled);
+    }
+
+    /// Tests that the filter_runs function acts same as .collect()
+    /// on runs if there are no during or not_during
+    #[test]
+    fn filter_runs_no_filters() {
+        let first = SegmentRun {
+            deaths: 1,
+            interval: Interval {
+                start: MillisecondsSinceEpoch(0),
+                end: MillisecondsSinceEpoch(100),
+            },
+            canceled: true,
+        };
+        let second = SegmentRun {
+            deaths: 0,
+            interval: Interval {
+                start: MillisecondsSinceEpoch(1000),
+                end: MillisecondsSinceEpoch(1200),
+            },
+            canceled: false,
+        };
+        let third = SegmentRun {
+            deaths: 2,
+            interval: Interval {
+                start: MillisecondsSinceEpoch(100_000),
+                end: MillisecondsSinceEpoch(101_000),
+            },
+            canceled: false,
+        };
+        let during: Vec<std::vec::IntoIter<&SegmentRun>> = Vec::new();
+        let not_during: Vec<std::vec::IntoIter<&SegmentRun>> = Vec::new();
+        let mut filtered = filter_runs(
+            vec![&first, &second, &third].into_iter(),
+            during,
+            not_during,
+        )
+        .into_iter();
+        assert!(ptr::eq(filtered.next().unwrap(), &first));
+        assert!(ptr::eq(filtered.next().unwrap(), &second));
+        assert!(ptr::eq(filtered.next().unwrap(), &third));
+        assert!(filtered.next().is_none());
+    }
+
+    /// Tests that the filter_runs function correctly accounts for
+    /// during and not_during when some iterators are passed to them.
+    #[test]
+    fn filter_runs_with_filters() {
+        let first = SegmentRun {
+            deaths: 1,
+            interval: Interval {
+                start: MillisecondsSinceEpoch(0),
+                end: MillisecondsSinceEpoch(100),
+            },
+            canceled: true,
+        };
+        let second = SegmentRun {
+            deaths: 0,
+            interval: Interval {
+                start: MillisecondsSinceEpoch(1000),
+                end: MillisecondsSinceEpoch(1200),
+            },
+            canceled: false,
+        };
+        let third = SegmentRun {
+            deaths: 2,
+            interval: Interval {
+                start: MillisecondsSinceEpoch(100_000),
+                end: MillisecondsSinceEpoch(101_000),
+            },
+            canceled: false,
+        };
+        let fourth = SegmentRun {
+            deaths: 4,
+            interval: Interval {
+                start: MillisecondsSinceEpoch(1_000),
+                end: MillisecondsSinceEpoch(200_000),
+            },
+            canceled: false,
+        };
+        let fifth = SegmentRun {
+            deaths: 3,
+            interval: Interval {
+                start: MillisecondsSinceEpoch(100_000),
+                end: MillisecondsSinceEpoch(150_000),
+            },
+            canceled: false,
+        };
+        let during = vec![vec![&fourth].into_iter()];
+        let not_during = vec![vec![&fifth].into_iter()];
+        let mut filtered = filter_runs(
+            vec![&first, &second, &third].into_iter(),
+            during,
+            not_during,
+        )
+        .into_iter();
+        assert!(ptr::eq(filtered.next().unwrap(), &second));
+        assert!(filtered.next().is_none());
     }
 }

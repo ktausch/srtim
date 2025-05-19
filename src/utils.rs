@@ -107,6 +107,72 @@ impl Drop for TempFile {
     }
 }
 
+/// A struct that supplements an iterator with storage
+/// of the most recently yielded element.
+pub struct IteratorWithMemory<T, I>
+where
+    I: Iterator<Item = T>,
+{
+    /// the most recently yielded element from the iterator.
+    /// None if haven't advanced yet or iterator is exhausted
+    current: Option<T>,
+    /// underlying iterator
+    iterator: I,
+}
+
+impl<T, I> IteratorWithMemory<T, I>
+where
+    I: Iterator<Item = T>,
+{
+    pub fn current(&self) -> Option<&T> {
+        self.current.as_ref()
+    }
+
+    /// Constructs a new IteratorWithMemory out of the given iterator
+    pub fn new(iterator: I) -> Self {
+        Self {
+            current: None,
+            iterator,
+        }
+    }
+
+    /// Advances the iterator and updates the element in memory
+    pub fn advance(&mut self) {
+        self.current = self.iterator.next();
+    }
+
+    /// Advances the iterator zero or more times until either
+    /// 1) the iterator is exhausted; or
+    /// 2) the element in memory satisfies the given condition
+    pub fn advance_until<C>(&mut self, condition: C)
+    where
+        C: Fn(&T) -> bool,
+    {
+        loop {
+            if let Some(current) = &self.current {
+                if condition(current) {
+                    return;
+                }
+            }
+            self.advance();
+            if self.current.is_none() {
+                return;
+            }
+        }
+    }
+}
+
+/// Panics if the given expression doesn't match the given pattern.
+/// Optionally, the caller can provide a panic message.
+///
+/// Example:
+///
+/// ```rust
+/// use srtim::assert_pattern;
+/// let y = Some(1);
+/// // equivalent to if !y.is_some() {panic!("custom error message");}
+/// assert_pattern!(y, Some(_), "custom error message");
+/// ```
 #[macro_export]
 macro_rules! assert_pattern {
     ($expression:expr, $pattern:pat) => {
@@ -124,6 +190,18 @@ macro_rules! assert_pattern {
     };
 }
 
+/// Panics if the given expression doesn't match the given pattern. If
+/// the pattern matches, the third argument is used to bind to elements
+/// from the pattern. Optionally, the caller can provide a panic message.
+///
+/// Example:
+///
+/// ```rust
+/// use srtim::coerce_pattern;
+/// let y = Some(1);
+/// // equivalent to let x = y.expect("custom error message");
+/// let z = coerce_pattern!(y, Some(x), x, "custom error message");
+/// ```
 #[macro_export]
 macro_rules! coerce_pattern {
     ($expression:expr, $pattern:pat, $result:expr) => {
@@ -353,7 +431,7 @@ mod tests {
         assert!(tokens.next().is_none());
     }
 
-    /// Ensures that
+    /// Ensures that TempFile::with_contents creates a file with the given contents.
     #[test]
     fn temp_file_with_contents() {
         let path = temp_dir().join("temp_file_with_contents.txt");
@@ -365,5 +443,52 @@ mod tests {
         );
         drop(temp_file);
         assert!(!fs::exists(path).unwrap());
+    }
+
+    /// Checks that current() is always empty when IteratorWithMemory
+    /// is given an iterator that doesn't yield any elements.
+    #[test]
+    fn iterator_with_memory_empty() {
+        let v: Vec<i32> = Vec::new();
+        let mut i = IteratorWithMemory::new(v.into_iter());
+        assert!(i.current().is_none());
+        i.advance();
+        assert!(i.current().is_none());
+    }
+
+    /// Checks that the IteratorWithMemory::advance() method
+    /// advances the iterator by exactly one element each time.
+    #[test]
+    fn iterator_with_memory_advance_manually() {
+        let mut i = IteratorWithMemory::new(vec![1, 3, 5, 4].into_iter());
+        assert!(i.current().is_none());
+        i.advance();
+        assert_eq!(i.current().unwrap(), &1);
+        i.advance();
+        assert_eq!(i.current().unwrap(), &3);
+        i.advance();
+        assert_eq!(i.current().unwrap(), &5);
+        i.advance();
+        assert_eq!(i.current().unwrap(), &4);
+        i.advance();
+        assert!(i.current().is_none());
+        i.advance();
+        assert!(i.current().is_none());
+    }
+
+    /// Checks that the IteratorWithMemory::advance_until method zero or
+    /// more elements and either the current() is either None or Some(x)
+    /// where x satisfies the condition given to the method
+    #[test]
+    fn iterator_with_memory_advance_with_condition() {
+        let mut i = IteratorWithMemory::new(vec![1, 3, 5, 4].into_iter());
+        i.advance_until(|element| element % 2 == 0);
+        assert_eq!(i.current().unwrap(), &4);
+        i.advance_until(|element| element % 2 == 0);
+        assert_eq!(i.current().unwrap(), &4);
+        i.advance();
+        assert!(i.current().is_none());
+        i.advance_until(|element| element % 2 == 0);
+        assert!(i.current().is_none());
     }
 }
