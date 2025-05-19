@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::segment_info::{RunPart, SegmentGroupInfo, SegmentInfo};
 use crate::segment_run::{
     Interval, SegmentRun, SegmentRunEvent, SegmentStats,
-    SupplementedSegmentRun, format_duration,
+    SupplementedSegmentRun, filter_runs, format_duration,
 };
 use crate::utils::load_n_tokens;
 
@@ -715,7 +715,8 @@ impl Config {
         }
     }
 
-    /// Gets the best, worst, mean, and median duration and death of given part
+    /// Gets the best, worst, mean, and median duration and death of given part. This method
+    /// assumes that the all runs of a given segment or group are stored sorted chronologically.
     pub fn get_stats<'a, D, N>(
         &self,
         id_name: &'a str,
@@ -741,29 +742,23 @@ impl Config {
                 self.use_run_info(n, |run_part| run_part.get_runs(true))??,
             );
         }
-        let mut filtered_runs = Vec::new();
-        'outer: for run_index in 0..runs.len() {
-            let run: &SegmentRun = &runs[run_index];
-            for during_part_index in 0..during_parts.len() {
-                let during_part =
-                    &during_parts[during_part_index] as &[SegmentRun];
-                if !during_part.iter().any(|during_run: &SegmentRun| {
-                    during_run.interval.contains(&run.interval)
-                }) {
-                    continue 'outer;
-                }
-            }
-            for not_during_part_index in 0..not_during_parts.len() {
-                let not_during_part =
-                    &not_during_parts[not_during_part_index] as &[SegmentRun];
-                if not_during_part.iter().any(|not_during_run: &SegmentRun| {
-                    not_during_run.interval.contains(&run.interval)
-                }) {
-                    continue 'outer;
-                }
-            }
-            filtered_runs.push(run);
-        }
+        let during_parts: Vec<&[SegmentRun]> =
+            during_parts.iter().map(|x| x as &[SegmentRun]).collect();
+        let not_during_parts: Vec<&[SegmentRun]> = not_during_parts
+            .iter()
+            .map(|x| x as &[SegmentRun])
+            .collect();
+        let filtered_runs = filter_runs(
+            (&runs as &[SegmentRun]).iter(),
+            during_parts
+                .into_iter()
+                .map(|x: &[SegmentRun]| x.iter())
+                .collect(),
+            not_during_parts
+                .into_iter()
+                .map(|x: &[SegmentRun]| x.iter())
+                .collect(),
+        );
         let end = MillisecondsSinceEpoch::now();
         let interval = Interval { start, end };
         println!(
